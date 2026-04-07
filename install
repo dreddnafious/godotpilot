@@ -1,54 +1,26 @@
 #!/usr/bin/env bash
-# install — copy GodotPilot.cs and gdpilot into a target Godot project.
+# install — copy GodotPilot.cs and gdpilot into a target directory.
 #
-# Usage: install <game-project-dir>
+# Usage: install <target-dir>
 #
 # Idempotent: re-run any time you update the canonical source and want to push
-# the latest version into a game. Overwrites the existing files in the target.
+# the latest version. Overwrites existing files at the destination.
 #
 # The canonical source lives in this repo. Edits go here, then `install` pushes
-# to consumers. Don't edit the copies in game projects — they get overwritten on
-# the next install.
+# to consumers. Don't edit the copies in target projects — they get overwritten
+# on the next install.
 
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
-    echo "Usage: $0 <game-project-dir>" >&2
-    echo "" >&2
-    echo "Copies GodotPilot.cs and gdpilot into the target Godot project." >&2
+    echo "Usage: $0 <target-dir>" >&2
     exit 1
 fi
 
 TARGET="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Verify target is a Godot project
-if [ ! -d "$TARGET" ]; then
-    echo "Error: $TARGET is not a directory" >&2
-    exit 1
-fi
-
-if [ ! -f "$TARGET/project.godot" ]; then
-    echo "Error: $TARGET does not contain a project.godot — not a Godot project" >&2
-    exit 1
-fi
-
-# Verify source files exist
-if [ ! -f "$SCRIPT_DIR/GodotPilot.cs" ]; then
-    echo "Error: $SCRIPT_DIR/GodotPilot.cs not found — is this the godotpilot repo?" >&2
-    exit 1
-fi
-
-if [ ! -f "$SCRIPT_DIR/gdpilot" ]; then
-    echo "Error: $SCRIPT_DIR/gdpilot not found — is this the godotpilot repo?" >&2
-    exit 1
-fi
-
-# Create target directories if missing
-mkdir -p "$TARGET/scripts/core"
-mkdir -p "$TARGET/tools"
-
-# Copy files
+mkdir -p "$TARGET/scripts/core" "$TARGET/tools"
 cp "$SCRIPT_DIR/GodotPilot.cs" "$TARGET/scripts/core/GodotPilot.cs"
 cp "$SCRIPT_DIR/gdpilot" "$TARGET/tools/gdpilot"
 chmod +x "$TARGET/tools/gdpilot"
@@ -56,15 +28,13 @@ chmod +x "$TARGET/tools/gdpilot"
 echo "Installed godotpilot into $TARGET" >&2
 echo "  $TARGET/scripts/core/GodotPilot.cs" >&2
 echo "  $TARGET/tools/gdpilot" >&2
-echo "" >&2
 
-# Check if the autoload is already registered; print a hint if not
-if ! grep -q '^GodotPilot=' "$TARGET/project.godot" 2>/dev/null; then
-    echo "Next step: register the autoload in $TARGET/project.godot" >&2
+# Hint about autoload registration if there's a project.godot to check.
+# Not blocking — just informational, since the autoload registration is the one
+# step the install can't do for you.
+if [ -f "$TARGET/project.godot" ] && ! grep -q '^GodotPilot=' "$TARGET/project.godot" 2>/dev/null; then
     echo "" >&2
+    echo "Register the autoload in $TARGET/project.godot:" >&2
     echo "  [autoload]" >&2
     echo "  GodotPilot=\"*res://scripts/core/GodotPilot.cs\"" >&2
-    echo "" >&2
-else
-    echo "Autoload already registered in project.godot ✓" >&2
 fi
