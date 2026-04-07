@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""GodotPilot CLI — remote control for a running Godot game.
+
+Connects to GodotPilot.cs TCP server, sends a command, prints the result.
+No dependencies beyond Python stdlib.
+"""
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 6550
+TIMEOUT = 10.0
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _scan_godot_candidates() -> list[tuple[str, str]]:
+    """Scan for all Godot binaries on this machine.
+
+    Returns list of (path, source) tuples, ordered by preference.
+    Source describes where it was found (for user feedback).
+    """
+    import glob
+    import platform
+    import shutil
+
+    found = []
+
+    # 1. GODOT_BIN env var
+    env = os.environ.get("GODOT_BIN")
+    if env:
+        expanded = os.path.expanduser(env)
+        if os.path.isfile(expanded):
+            found.append((expanded, "GODOT_BIN env var"))
+
+    # 2. .godot_bin project config
+    config = os.path.join(PROJECT_DIR, ".godot_bin")
+    if os.path.isfile(config):
+        with open(config) as f:
+            path = os.path.expanduser(f.read().strip())
+        if os.path.isfile(path):
+            found.append((path, f".godot_bin config"))
+
+    # 3. PATH lookup
+    for name in ("godot", "godot4"):
+        p = shutil.which(name)
+        if p:
+            found.append((p, f"'{name}' on PATH"))
+
+    # 4. Platform-specific common locations
+    home = os.path.expanduser("~")
+    system = platform.system()
+
+    if system == "Linux":
+        # Unpacked tarballs in home dir (official download pattern)
+        for pattern in ("~/Godot_v*/Godot_v*", "~/godot/Godot_v*"):
+            for c in sorted(glob.glob(os.path.expanduser(pattern)), reverse=True):
+                if os.path.isfile(c) and os.access(c, os.X_OK):
+                    found.append((c, "home directory"))
+        # Flatpak
+        flatpak = shutil.which("flatpak")
+        if flatpak:
+            for app_id in ("org.godotengine.GodotMono", "org.godotengine.Godot"):
+                fp_path = f"/var/lib/flatpak/exports/bin/{app_id}"
+                if os.path.isfile(fp_path):
+                    found.append((fp_path, f"flatpak ({app_id})"))
+        # Snap
+        for p in ("/snap/bin/godot", "/snap/bin/godot4"):
+            if os.path.isfile(p):
+                found.append((p, "snap"))
+
+    elif system == "Darwin":
+        # macOS: /Applications, Homebrew
+        for pattern in (
+            "/Applications/Godot_mono.app/Contents/MacOS/Godot",
+            "/Applications/Godot.app/Contents/MacOS/Godot",
+            f"{home}/Applications/Godot_mono.app/Contents/MacOS/Godot",
+        ):
+            for c in glob.glob(pattern):
+                if os.path.isfile(c):
+                    found.append((c, "Applications"))
+
+    elif system == "Windows":
+        # Windows: common install locations
+        for pattern in (
+            os.path.expandvars(r"%LOCALAPPDATA%\Godot\Godot_v*\Godot_v*.exe"),
+            r"C:\Godot\Godot_v*.exe",
+            os.path.join(home, "Godot_v*", "Godot_v*.exe"),
+            os.path.expandvars(r"%PROGRAMFILES%\Godot\Godot_v*.exe"),
+        ):
+            for c in sorted(glob.glob(pattern), reverse=True):
+                if os.path.isfile(c):
+                    found.append((c, "local install"))
+        # Scoop
+        scoop = os.path.join(home, "scoop", "shims", "godot.exe")
+        if os.path.isfile(scoop):
+            found.append((scoop, "scoop"))
+
+    # Deduplicate by resolved path, keep first occurrence (highest priority)
+    seen = set()
+    deduped = []
+    for path, source in found:
+        real = os.path.realpath(path)
+        if real not in seen:
+            seen.add(real)
+            deduped.append((path, source))
+
+    return deduped
+
+
+def _find_godot_binary() -> str:
+    """Return the best Godot binary, or empty string."""
+    candidates = _scan_godot_candidates()
+    return candidates[0][0] if candidates else ""
+
+
+GODOT_BIN = _find_godot_binary()
+
+
+def send_command(host: str, port: int, cmd: str, args: dict | None = None) -> dict:
+    """Connect, send command, read response, disconnect."""
+    payload = {"cmd": cmd}
+    if args:
+        payload["args"] = args
+
+    with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
+        sock.sendall((json.dumps(payload) + "\n").encode())
+        # Read until newline
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+
+    line = buf.decode().strip()
+    if not line:
+        return {"ok": False, "error": "Empty response from game"}
+    return json.loads(line)
+
+
+def die(msg: str) -> None:
+    """Print error to both stderr (human) and stdout (agent JSON), then exit 1."""
+    print(msg, file=sys.stderr)
+    print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(1)
+
+
+def emit(result: dict, pretty: bool) -> None:
+    """Print result JSON to stdout. Always JSON, one line unless pretty."""
+    if pretty:
+        print(json.dumps(result, indent=2))
+    else:
+        print(json.dumps(result))
+
+
+# ── Subcommand handlers ──────────────────────────────────────────────
+
+
+def cmd_screenshot(args, host, port, pretty):
+    result = send_command(host, port, "screenshot", {"max_width": args.max_width})
+    if not result.get("ok", True):
+        die(result.get("error", "screenshot failed"))
+    emit(result, pretty)
+
+
+def cmd_click(args, host, port, pretty):
+    x, y = args.x, args.y
+    # If --from-screenshot, scale coords from screenshot resolution to viewport resolution
+    if args.from_screenshot:
+        vp = send_command(host, port, "viewport_info")
+        if vp.get("ok", True) and "viewport_width" in vp:
+            # Screenshot is always max_width=1280 by default
+            screenshot_w = args.from_screenshot
+            scale = vp["viewport_width"] / screenshot_w
+            x *= scale
+            y *= scale
+    result = send_command(host, port, "click", {
+        "x": x, "y": y, "button": args.button,
+    })
+    emit(result, pretty)
+
+
+def cmd_drag(args, host, port, pretty):
+    result = send_command(host, port, "drag", {
+        "x1": args.x1, "y1": args.y1,
+        "x2": args.x2, "y2": args.y2,
+        "steps": args.steps, "button": args.button,
+    })
+    emit(result, pretty)
+
+
+def cmd_type(args, host, port, pretty):
+    result = send_command(host, port, "type", {
+        "text": args.text, "submit": args.submit,
+    })
+    emit(result, pretty)
+
+
+def cmd_action(args, host, port, pretty):
+    result = send_command(host, port, "action", {
+        "name": args.name, "duration_ms": args.duration,
+    })
+    emit(result, pretty)
+
+
+def cmd_tree(args, host, port, pretty):
+    a = {}
+    if args.path:
+        a["path"] = args.path
+    if args.depth:
+        a["depth"] = args.depth
+    result = send_command(host, port, "tree", a)
+    emit(result, pretty)
+
+
+def cmd_find(args, host, port, pretty):
+    a = {"pattern": args.pattern}
+    if args.type:
+        a["type"] = args.type
+    result = send_command(host, port, "find", a)
+    emit(result, pretty)
+
+
+def cmd_get(args, host, port, pretty):
+    result = send_command(host, port, "get", {
+        "node_path": args.node_path, "property": args.property,
+    })
+    emit(result, pretty)
+
+
+def cmd_props(args, host, port, pretty):
+    result = send_command(host, port, "props", {"node_path": args.node_path})
+    emit(result, pretty)
+
+
+def cmd_set(args, host, port, pretty):
+    a = {"node_path": args.node_path, "property": args.property, "value": args.value}
+    # Try to parse value as number/bool for proper JSON typing
+    val = args.value
+    if val.lower() in ("true", "false"):
+        a["value"] = val.lower() == "true"
+    elif val.startswith("{"):
+        try:
+            a["value"] = json.loads(val)
+        except json.JSONDecodeError:
+            pass
+    else:
+        try:
+            a["value"] = int(val)
+        except ValueError:
+            try:
+                a["value"] = float(val)
+            except ValueError:
+                pass
+    result = send_command(host, port, "set", a)
+    emit(result, pretty)
+
+
+def cmd_sequence(args, host, port, pretty):
+    """Send overlapping input action sequence."""
+    actions = []
+    if args.json:
+        actions = json.loads(args.json)
+    else:
+        # Parse positional: name:start_ms:duration_ms name:start_ms:duration_ms ...
+        for spec in args.actions:
+            parts = spec.split(":")
+            name = parts[0]
+            start_ms = int(parts[1]) if len(parts) > 1 else 0
+            duration_ms = int(parts[2]) if len(parts) > 2 else 500
+            actions.append({"name": name, "start_ms": start_ms, "duration_ms": duration_ms})
+    result = send_command(host, port, "sequence", {"actions": actions})
+    emit(result, pretty)
+
+
+def cmd_click_node(args, host, port, pretty):
+    a = {}
+    if args.text:
+        a["text"] = args.text
+    elif args.path:
+        a["path"] = args.path
+    else:
+        die("Provide --text or --path")
+    if args.button != 1:
+        a["button"] = args.button
+    result = send_command(host, port, "click_node", a)
+    emit(result, pretty)
+
+
+def cmd_hover(args, host, port, pretty):
+    a = {}
+    if args.text:
+        a["text"] = args.text
+    elif args.path:
+        a["path"] = args.path
+    elif args.x is not None and args.y is not None:
+        a["x"] = args.x
+        a["y"] = args.y
+    else:
+        die("Provide --text, --path, or x/y coordinates")
+    result = send_command(host, port, "hover", a)
+    emit(result, pretty)
+
+
+def cmd_viewport_info(args, host, port, pretty):
+    result = send_command(host, port, "viewport_info")
+    emit(result, pretty)
+
+
+def cmd_perf(args, host, port, pretty):
+    result = send_command(host, port, "perf")
+    emit(result, pretty)
+
+
+def cmd_log(args, host, port, pretty):
+    result = send_command(host, port, "log", {"clear": args.clear})
+    emit(result, pretty)
+
+
+def cmd_wait(args, host, port, pretty):
+    result = send_command(host, port, "wait", {"ms": args.ms})
+    emit(result, pretty)
+
+
+def cmd_game_cmd(args, host, port, pretty):
+    """Run a registered game command via the 'cmd' subcommand."""
+    cmd_args = {}
+    if args.args:
+        for pair in args.args:
+            key, _, val = pair.partition("=")
+            key = key.lstrip("-").replace("-", "_")
+            # Try to parse as number/bool
+            if val.lower() in ("true", "false"):
+                cmd_args[key] = val.lower() == "true"
+            else:
+                try:
+                    cmd_args[key] = int(val)
+                except ValueError:
+                    try:
+                        cmd_args[key] = float(val)
+                    except ValueError:
+                        cmd_args[key] = val
+    result = send_command(host, port, args.name, cmd_args)
+    emit(result, pretty)
+
+
+def cmd_console(args, host, port, pretty):
+    """Run a console command string."""
+    result = send_command(host, port, "run_console", {"command": args.command})
+    emit(result, pretty)
+
+
+def cmd_list(args, host, port, pretty):
+    """List all registered commands."""
+    result = send_command(host, port, "list_commands")
+    emit(result, pretty)
+
+
+def cmd_run(args, host, port, pretty):
+    """Launch the game and wait for GodotPilot to be ready."""
+    # Check if already running
+    if _is_game_running(host, port):
+        print("Game is already running.", file=sys.stderr)
+        emit({"ok": True, "already_running": True}, pretty)
+        return
+
+    if not GODOT_BIN or not os.path.isfile(GODOT_BIN):
+        die("Godot binary not found. Run 'gdpilot setup' to configure.")
+
+    # Reimport assets before launching (ensures new GLBs/PNGs are available)
+    print("Importing assets...", file=sys.stderr)
+    subprocess.run(
+        [GODOT_BIN, "--path", PROJECT_DIR, "--headless", "--import"],
+        capture_output=True, timeout=60,
+    )
+
+    cmd = [GODOT_BIN, "--path", PROJECT_DIR]
+    if args.scene:
+        cmd.append(args.scene)
+    if args.verbose:
+        cmd.append("--verbose")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL if not args.verbose else None,
+        stderr=subprocess.DEVNULL if not args.verbose else None,
+    )
+
+    # Wait for TCP server to come up
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            die(f"Godot exited immediately with code {proc.returncode}")
+        if _is_game_running(host, port):
+            emit({"ok": True, "pid": proc.pid}, pretty)
+            return
+        time.sleep(0.3)
+
+    die(f"Timed out waiting {args.timeout}s for GodotPilot on {host}:{port}")
+
+
+def cmd_stop(args, host, port, pretty):
+    """Send quit command to the running game."""
+    try:
+        result = send_command(host, port, "quit")
+        emit(result, pretty)
+    except (ConnectionRefusedError, OSError, socket.timeout, TimeoutError):
+        print("Game is not running.", file=sys.stderr)
+        emit({"ok": True, "already_stopped": True}, pretty)
+
+
+def cmd_setup(args, host, port, pretty):
+    """Scan for Godot binaries and write .godot_bin config."""
+    candidates = _scan_godot_candidates()
+
+    if not candidates:
+        die(
+            "No Godot binary found.\n"
+            "Install Godot with C#/Mono support, then either:\n"
+            "  - Add it to your PATH as 'godot' or 'godot4'\n"
+            "  - Set the GODOT_BIN environment variable\n"
+            "  - Run: echo '/path/to/godot' > .godot_bin"
+        )
+
+    # If --path was given explicitly, use that
+    if args.path:
+        expanded = os.path.expanduser(args.path)
+        if not os.path.isfile(expanded):
+            die(f"Not a file: {expanded}")
+        chosen = expanded
+    else:
+        # Use the best candidate
+        chosen = candidates[0][0]
+
+    # Show what was found
+    print("Godot binaries found:", file=sys.stderr)
+    for i, (path, source) in enumerate(candidates):
+        marker = " *" if path == chosen else "  "
+        print(f"  {marker} {path}  ({source})", file=sys.stderr)
+
+    # Write .godot_bin
+    config_path = os.path.join(PROJECT_DIR, ".godot_bin")
+    with open(config_path, "w") as f:
+        f.write(chosen + "\n")
+    print(f"\nWrote {config_path}", file=sys.stderr)
+
+    emit({"ok": True, "godot_bin": chosen, "config": config_path}, pretty)
+
+
+def _is_game_running(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=1.0) as sock:
+            sock.sendall(b'{"cmd":"perf"}\n')
+            data = sock.recv(4096)
+            return bool(data)
+    except (ConnectionRefusedError, OSError, socket.timeout):
+        return False
+
+
+# ── CLI setup ─────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="gdpilot",
+        description="Remote control for a running Godot game via GodotPilot",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help="GodotPilot host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="GodotPilot port (default: 6550)")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+
+    sub = parser.add_subparsers(dest="subcmd", help="Command to run")
+
+    # screenshot
+    p = sub.add_parser("screenshot", help="Capture viewport screenshot")
+    p.add_argument("--max-width", type=int, default=1280, help="Max width in pixels (default: 1280)")
+
+    # click
+    p = sub.add_parser("click", help="Click at viewport coords; hit-tests UI buttons, falls back to PushInput for 3D")
+    p.add_argument("x", type=float, help="X in viewport coordinates (or screenshot coords with --from-screenshot)")
+    p.add_argument("y", type=float, help="Y in viewport coordinates (or screenshot coords with --from-screenshot)")
+    p.add_argument("--button", type=int, default=1, help="Mouse button (1=left, 2=right, 3=middle)")
+    p.add_argument("--from-screenshot", type=int, default=0, metavar="WIDTH",
+                   help="Translate from screenshot resolution to viewport (e.g. 1280 → uniform *1.5)")
+
+    # drag
+    p = sub.add_parser("drag", help="Inject mouse drag")
+    p.add_argument("x1", type=float, help="Start X")
+    p.add_argument("y1", type=float, help="Start Y")
+    p.add_argument("x2", type=float, help="End X")
+    p.add_argument("y2", type=float, help="End Y")
+    p.add_argument("--steps", type=int, default=10, help="Interpolation steps")
+    p.add_argument("--button", type=int, default=1, help="Mouse button")
+
+    # type
+    p = sub.add_parser("type", help="Type text characters")
+    p.add_argument("text", help="Text to type")
+    p.add_argument("--submit", action="store_true", help="Press Enter after typing")
+
+    # action
+    p = sub.add_parser("action", help="Trigger input action")
+    p.add_argument("name", help="Action name (e.g. camera_pan_up)")
+    p.add_argument("--duration", type=int, default=100, help="Hold duration in ms")
+
+    # tree
+    p = sub.add_parser("tree", help="Dump scene tree")
+    p.add_argument("--path", default=None, help="Root node path (default: /root)")
+    p.add_argument("--depth", type=int, default=None, help="Max depth (default: 3)")
+
+    # find
+    p = sub.add_parser("find", help="Search nodes by name/type")
+    p.add_argument("pattern", help="Name pattern to search")
+    p.add_argument("--type", default=None, help="Filter by node type")
+
+    # get
+    p = sub.add_parser("get", help="Read a node property")
+    p.add_argument("node_path", help="Node path")
+    p.add_argument("property", help="Property name")
+
+    # props
+    p = sub.add_parser("props", help="Dump all properties on a node")
+    p.add_argument("node_path", help="Node path")
+
+    # set
+    p = sub.add_parser("set", help="Write a node property")
+    p.add_argument("node_path", help="Node path")
+    p.add_argument("property", help="Property name")
+    p.add_argument("value", help="Value to set (auto-parsed as number/bool/JSON object)")
+
+    # sequence
+    p = sub.add_parser("sequence", help="Overlapping input action sequence")
+    p.add_argument("actions", nargs="*", help="Actions as name:start_ms:duration_ms (e.g. ui_up:0:500 ui_right:200:300)")
+    p.add_argument("--json", default=None, help='JSON array: [{"name":"x","start_ms":0,"duration_ms":500}]')
+
+    # click_node
+    p = sub.add_parser("click_node", help="Click a UI element by text or node path")
+    p.add_argument("--text", default=None, help="Find button/label containing this text")
+    p.add_argument("--path", default=None, help="Node path to a Control")
+    p.add_argument("--button", type=int, default=1, help="Mouse button (default: 1)")
+
+    # hover
+    p = sub.add_parser("hover", help="Move cursor to a position or UI element")
+    p.add_argument("--text", default=None, help="Find control containing this text")
+    p.add_argument("--path", default=None, help="Node path to a Control")
+    p.add_argument("--x", type=float, default=None, help="Screen X coordinate")
+    p.add_argument("--y", type=float, default=None, help="Screen Y coordinate")
+
+    # viewport_info
+    sub.add_parser("viewport_info", help="Get window/viewport resolution and scale factors")
+
+    # perf
+    sub.add_parser("perf", help="Show performance metrics")
+
+    # log
+    p = sub.add_parser("log", help="Read captured log output")
+    p.add_argument("--clear", action="store_true", help="Clear log after reading")
+
+    # wait
+    p = sub.add_parser("wait", help="Wait for specified time")
+    p.add_argument("ms", type=int, help="Milliseconds to wait")
+
+    # cmd (game-specific)
+    p = sub.add_parser("cmd", help="Run a registered game command")
+    p.add_argument("name", help="Command name")
+    p.add_argument("args", nargs="*", help="Arguments as key=value pairs (e.g. grid_x=5 grid_y=3)")
+
+    # console
+    p = sub.add_parser("console", help="Run a console command string")
+    p.add_argument("command", help="Console command text")
+
+    # list
+    sub.add_parser("list", help="List all registered commands")
+
+    # run
+    p = sub.add_parser("run", help="Launch the game and wait for GodotPilot to be ready")
+    p.add_argument("--timeout", type=float, default=30, help="Seconds to wait for game to start (default: 30)")
+    p.add_argument("--verbose", action="store_true", help="Show Godot stdout/stderr")
+    p.add_argument("--scene", default=None, help="Run a specific scene (e.g. res://scenes/main/Game.tscn)")
+
+    # stop
+    sub.add_parser("stop", help="Quit the running game")
+
+    # setup
+    p = sub.add_parser("setup", help="Find Godot binary and write .godot_bin config")
+    p.add_argument("--path", default=None, help="Explicit path to Godot binary (skip scanning)")
+
+    args = parser.parse_args()
+
+    if not args.subcmd:
+        parser.print_help()
+        sys.exit(0)
+
+    handler = {
+        "screenshot": cmd_screenshot,
+        "click": cmd_click,
+        "drag": cmd_drag,
+        "type": cmd_type,
+        "action": cmd_action,
+        "tree": cmd_tree,
+        "find": cmd_find,
+        "get": cmd_get,
+        "props": cmd_props,
+        "set": cmd_set,
+        "sequence": cmd_sequence,
+        "click_node": cmd_click_node,
+        "hover": cmd_hover,
+        "viewport_info": cmd_viewport_info,
+        "perf": cmd_perf,
+        "log": cmd_log,
+        "wait": cmd_wait,
+        "cmd": cmd_game_cmd,
+        "console": cmd_console,
+        "list": cmd_list,
+        "run": cmd_run,
+        "stop": cmd_stop,
+        "setup": cmd_setup,
+    }.get(args.subcmd)
+
+    if not handler:
+        die(f"Unknown subcommand: {args.subcmd}")
+
+    # run and stop don't need an existing connection
+    if args.subcmd in ("run", "stop", "setup"):
+        handler(args, args.host, args.port, args.pretty)
+        return
+
+    try:
+        handler(args, args.host, args.port, args.pretty)
+    except ConnectionRefusedError:
+        die(f"Cannot connect to GodotPilot at {args.host}:{args.port} — is the game running?")
+    except socket.timeout:
+        die(f"Connection to {args.host}:{args.port} timed out")
+    except json.JSONDecodeError as e:
+        die(f"Invalid response from game: {e}")
+
+
+if __name__ == "__main__":
+    main()
