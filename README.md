@@ -9,27 +9,45 @@ Two pieces:
 - **`GodotPilot.cs`** — a C# autoload that runs inside the game and listens on `127.0.0.1:6550` for newline-delimited JSON commands. Provides screenshot capture, input simulation (click, drag, type, action), scene tree introspection (`tree`, `find`, `get`, `props`, `set`), perf monitoring, log capture, and a hook to register game-specific commands. ~1160 lines, no dependencies beyond Godot 4.x with C#.
 - **`gdpilot`** — a Python CLI client (stdlib only, no `pip install`) that wraps the wire protocol behind a subcommand interface and emits JSON to stdout, human messages to stderr. Also handles `run` (launch the game) and `stop` (quit it) so the agent can manage the lifecycle.
 
-From the agent's perspective the entire surface is `gdpilot <subcommand> [args]` from inside a game project. Same shape as `pablo_p`, `modelforge`, etc.
+From the agent's perspective the entire surface is `tools/gdpilot <subcommand> [args]` from inside the game project. Same shape as `pablo_p`, `modelforge`, etc.
 
-## Install into a game
+## Bootstrap a new game from an empty folder
 
-```
-git clone <godotpilot-repo> /home/you/dev/godotpilot
-/home/you/dev/godotpilot/install /path/to/your/game
-```
+The primary workflow. You have an empty directory and want a working Godot 4.6 C# project with godotpilot already wired in:
 
-The install script copies two files into the target Godot project:
-
-```
-<game>/scripts/core/GodotPilot.cs   # the C# autoload
-<game>/tools/gdpilot                 # the Python CLI
+```bash
+mkdir mygame && cd mygame
+/path/to/godotpilot/install . --name MyGame
+tools/gdpilot setup     # find and remember the Godot binary
+tools/gdpilot run        # launch the game; godotpilot listens on 127.0.0.1:6550
 ```
 
-It refuses to run if the target doesn't contain a `project.godot`. It's idempotent — re-run it any time you update the canonical source and want to push the latest version into a game.
+After `install . --name MyGame`, the directory contains:
 
-## Wire it as an autoload
+```
+mygame/
+├── project.godot          # config_version=5, autoload pre-registered
+├── MyGame.csproj          # Godot.NET.Sdk/4.6.1, net8.0
+├── MyGame.sln
+├── scripts/core/
+│   └── GodotPilot.cs      # the autoload
+└── tools/
+    └── gdpilot            # the CLI
+```
 
-After install, register the autoload in `<game>/project.godot`:
+`gdpilot run` does the right thing on first launch: it builds the C# solution (so the autoload's `.dll` exists before Godot tries to load it), re-imports assets, then launches the game and blocks until the TCP server is up. From that point you can drive the game with any of the commands in [COMMANDS.md](COMMANDS.md).
+
+The `--name` defaults to `Project` if you don't pass one. It's used as the C# project name, the assembly name, and the root namespace. You can rename later by editing the three files; nothing in godotpilot itself depends on it.
+
+## Add to an existing Godot project
+
+If you already have a Godot 4.x C# project and want to add godotpilot to it:
+
+```bash
+/path/to/godotpilot/install /path/to/existing/game
+```
+
+The install detects an existing `project.godot`, leaves it alone, and only copies the two source files into `scripts/core/` and `tools/`. It then prints a hint reminding you to register the autoload manually:
 
 ```ini
 [autoload]
@@ -37,35 +55,30 @@ After install, register the autoload in `<game>/project.godot`:
 GodotPilot="*res://scripts/core/GodotPilot.cs"
 ```
 
-That's it. Run the game; you should see:
+This is the only step the install can't do for you safely — your existing `project.godot` may have its own autoload section that needs to be merged with rather than overwritten. Add the line, re-launch the game, and you're done.
 
-```
-[GodotPilot] Listening on 127.0.0.1:6550
-```
+## Quickstart commands
 
-## Quickstart
+With the game running, from inside the project directory:
 
-With the game running:
-
-```
-cd /path/to/your/game
-tools/gdpilot screenshot                 # save a viewport PNG, return path + dimensions
-tools/gdpilot tree --depth 2              # dump the scene tree
-tools/gdpilot find Button                 # find all nodes with "Button" in the name
-tools/gdpilot props /root/Game            # dump every public property on a node
-tools/gdpilot click 640 360               # click at viewport coords
-tools/gdpilot click_node --text "Start"   # click a button by its text
-tools/gdpilot perf                        # FPS, memory, draw calls
-tools/gdpilot log                         # capture buffered GD.Print output
-tools/gdpilot list                        # list all registered commands
+```bash
+tools/gdpilot screenshot                  # save a viewport PNG, return path + dimensions
+tools/gdpilot tree --depth 2               # dump the scene tree
+tools/gdpilot find Button                  # find all nodes with "Button" in the name
+tools/gdpilot props /root/Game             # dump every public property on a node
+tools/gdpilot click 640 360                # click at viewport coords
+tools/gdpilot click_node --text "Start"    # click a button by its text
+tools/gdpilot perf                         # FPS, memory, draw calls
+tools/gdpilot log                          # capture buffered GD.Print output
+tools/gdpilot list                         # list all registered commands
 ```
 
 For game lifecycle:
 
-```
-tools/gdpilot setup                       # find and remember the Godot binary
-tools/gdpilot run                         # launch the game; returns when GodotPilot is ready
-tools/gdpilot stop                        # quit the game cleanly
+```bash
+tools/gdpilot setup                        # find and remember the Godot binary
+tools/gdpilot run                          # build C#, import, launch, wait until TCP is up
+tools/gdpilot stop                         # quit the game cleanly
 ```
 
 See [COMMANDS.md](COMMANDS.md) for the full command reference and [PROTOCOL.md](PROTOCOL.md) for the wire protocol if you want to talk to the autoload directly without the Python CLI.
@@ -78,7 +91,7 @@ See [COMMANDS.md § Registering game commands](COMMANDS.md#registering-game-comm
 
 ## Canonical source discipline
 
-**Edits to GodotPilot live in this repo, not in game-project copies.** The install script pushes source from here to a game; nothing pushes the other direction. If you fix a bug while working in a game project, port the fix back to the canonical repo before re-installing — otherwise the next install will overwrite your in-game change.
+**Edits to godotpilot live in this repo, not in game-project copies.** The install script pushes source from here to a game; nothing pushes the other direction. If you fix a bug while working in a game project, port the fix back to the canonical repo before re-installing — otherwise the next install will overwrite your in-game change.
 
 This is the price of the copy-based distribution model: per-project copies are robust against link rot and project moves, but the canonical source has to stay authoritative or you get drift. Re-running `install` against a game is the only sanctioned update path.
 
@@ -90,4 +103,6 @@ The fact that GodotPilot is internally a TCP server with a Python client wrapper
 
 ## Status
 
-Standalone repo extracted from rogue_defense (where it was co-developed with that game). Currently at the state it had reached as of extraction. Future work likely includes attribute-based command registration (`[PilotCommand]`), reflection-based event/signal graph queries, and a static lint pass for common Godot anti-patterns. None of that is here yet — this repo is the extraction baseline.
+Standalone repo extracted from rogue_defense (where it was co-developed with that game). Currently at the state it had reached as of extraction, plus the bootstrap/scaffold support added to `install` and the build-solutions step added to `gdpilot run` so that the empty-folder workflow works end-to-end.
+
+Future work likely includes attribute-based command registration (`[PilotCommand]`), reflection-based event/signal graph queries, and a static lint pass for common Godot anti-patterns. None of that is here yet — this repo is the extraction baseline.

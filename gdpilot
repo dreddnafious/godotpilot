@@ -374,6 +374,21 @@ def cmd_run(args, host, port, pretty):
     if not GODOT_BIN or not os.path.isfile(GODOT_BIN):
         die("Godot binary not found. Run 'gdpilot setup' to configure.")
 
+    # Build C# solutions and re-import assets before launching.
+    #
+    # --build-solutions handles the chicken-and-egg case on a fresh install:
+    # Godot tries to create autoloads in first_scan_filesystem, which runs
+    # *before* dotnet_build_project — so on a project with no compiled .dll
+    # yet, the autoload fails to load, the actual run hangs waiting for a
+    # TCP server that never came up. Building first ensures the .dll exists
+    # before the autoload is needed. Idempotent and fast on cache hit.
+    if any(p.endswith(".csproj") for p in os.listdir(PROJECT_DIR)):
+        print("Building C# solutions...", file=sys.stderr)
+        subprocess.run(
+            [GODOT_BIN, "--path", PROJECT_DIR, "--headless", "--build-solutions", "--quit"],
+            capture_output=True, timeout=120,
+        )
+
     # Reimport assets before launching (ensures new GLBs/PNGs are available)
     print("Importing assets...", file=sys.stderr)
     subprocess.run(
