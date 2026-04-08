@@ -187,6 +187,124 @@ Response:
 
 Optional args: `include_godot` (boolean, defaults false — set true to also include Godot framework properties like `name`, `position`, `process_priority`), `depth` (integer 0-3, default 1 — controls recursion into nested non-primitive members; lists truncate at 50 items).
 
+### Inspect static C# state (data libraries, constants) via reflection
+
+The non-Node equivalent of `describe`: walks public static fields and properties on a C# type by name. The type is resolved across all loaded assemblies; both fully qualified names and short names are accepted.
+
+Request — dump every public static member of a data library:
+```json
+{"cmd": "static", "args": {"type": "MyGame.Data.ItemLibrary"}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "type": "MyGame.Data.ItemLibrary",
+  "members": {
+    "ById": {"healing_potion": {"_type": "ItemData", ...}, "longsword": {"_type": "ItemData", ...}},
+    "All": ["<truncated>"]
+  }
+}
+```
+
+Request — single member with deeper recursion:
+```json
+{"cmd": "static", "args": {"type": "ItemLibrary", "member": "ById", "depth": 2}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "type": "MyGame.Data.ItemLibrary",
+  "member": "ById",
+  "value": {"healing_potion": {"Id": "healing_potion", "Name": "Healing Potion", ...}}
+}
+```
+
+Optional args: `member` (string — single field/property to inspect; omit to dump all), `depth` (integer 0-3, default 1 — recursion depth for nested objects).
+
+If the type isn't found, the response includes an `error` field with the unresolved name. If the member isn't found, the response includes an `available` array listing the static field/property names on the resolved type so the caller can pick the right one.
+
+### Invoke a method on a node or static type
+
+Calls a public method on either a Node instance (target = node path) or a static type (target = type name). Argument values are passed as a JSON array; primitives (string, int, long, double, bool, null) are coerced to the matching method parameter type server-side. Enum parameters accept their string name (case-insensitive).
+
+Request — invoke an instance method on an autoload:
+```json
+{"cmd": "invoke", "args": {"target": "/root/PartyManager", "method": "AddItem", "args": ["healing_potion", 1, true]}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "method": "PartyManager.AddItem",
+  "returned": true
+}
+```
+
+Request — invoke a static method on a type:
+```json
+{"cmd": "invoke", "args": {"target": "MyGame.Data.SaveSystem", "method": "QuickSave"}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "method": "SaveSystem.QuickSave",
+  "returned": null
+}
+```
+
+Optional args: `args` (array of values — omit or pass `[]` for no-arg methods).
+
+If the method isn't found, the response includes an `available` array listing method names on the resolved type. If overload resolution fails (no matching arg count, or coercion fails for every overload), the error message says so. If the invocation throws, the inner exception is unwrapped and reported as `Invoke threw: <ExceptionType>: <message>`.
+
+**Limitation**: only primitive parameter types are supported. Methods that take complex types (records, custom classes, enums on `BindingFlags.NonPublic` types) need a project-specific `RegisterCommand` wrapper.
+
+### Tail the Godot log file
+
+The `log` command has two modes selected via `source`:
+
+- `source: "buffer"` (default — backward compatible) returns the in-memory `CaptureLog` ring buffer. Response shape is `{count, lines}`, unchanged from the original command.
+- `source: "file"` reads the last `tail` lines (default 50) of the running game's Godot log file.
+
+Request — buffer mode (existing behavior, unchanged):
+```json
+{"cmd": "log", "args": {"clear": false}}
+```
+
+Response:
+```json
+{"ok": true, "count": 0, "lines": []}
+```
+
+Request — file mode:
+```json
+{"cmd": "log", "args": {"source": "file", "tail": 20}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "source": "file",
+  "path": "/home/user/.local/share/godot/app_userdata/MyGame/logs/godot.log",
+  "count": 20,
+  "total_lines": 1247,
+  "lines": [
+    "[GameManager] State: Combat",
+    "[CombatManager] Round 3 begins",
+    "..."
+  ]
+}
+```
+
+The buffer-mode response shape is preserved exactly for backward compatibility — existing bash callers using `echo '{"cmd":"log"}' | nc 127.0.0.1 6550` see the same `{count, lines}` shape they always have. The file-mode response is a strict superset (adds `source`, `path`, `total_lines`) that's only returned when `source: "file"` is explicitly passed.
+
 ## Connection lifecycle
 
 - **Connect** any time after the autoload's `_Ready` runs. The autoload prints `[GodotPilot] Listening on 127.0.0.1:6550` when ready. Connection refused before that point.

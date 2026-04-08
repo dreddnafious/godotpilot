@@ -3,6 +3,7 @@ namespace GodotPilot;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -264,6 +265,8 @@ public partial class GodotPilot : Node
         RegisterBuiltin("list_commands", CmdListCommands);
         RegisterBuiltin("signals", CmdSignals);
         RegisterBuiltin("describe", CmdDescribe);
+        RegisterBuiltin("static", CmdStatic);
+        RegisterBuiltin("invoke", CmdInvoke);
         RegisterBuiltin("quit", CmdQuit);
     }
 
@@ -864,20 +867,99 @@ public partial class GodotPilot : Node
         };
     }
 
+    /// <summary>
+    /// Read recent log lines. Two sources, selected via <c>source</c>:
+    ///
+    /// <para><b>source=buffer</b> (default — preserved from the original
+    /// command shape) — returns the in-memory ring buffer populated by
+    /// manual <c>CaptureLog</c> calls. The default behavior is unchanged
+    /// from the pre-2026-04-08 version of this command, so existing
+    /// callers see exactly the same response shape and contents.</para>
+    ///
+    /// <para><b>source=file</b> (opt-in) — reads the last <c>tail</c>
+    /// lines of the running game's Godot log file. Path resolved via
+    /// <c>ProjectSettings("debug/file_logging/log_path")</c>, default
+    /// <c>user://logs/godot.log</c>. Returns everything Godot has logged
+    /// (prints, warnings, errors, stack traces) without needing the
+    /// in-memory capture mechanism to be wired.</para>
+    ///
+    /// Args: <c>source</c> ("buffer" default, or "file"),
+    /// <c>tail</c> (int, default 50, file-mode only),
+    /// <c>clear</c> (bool, buffer-mode only — clears the buffer after
+    /// returning its current contents).
+    /// </summary>
     private Godot.Collections.Dictionary CmdLog(Dictionary<string, JsonElement> args)
     {
-        bool clear = args.TryGetValue("clear", out var cv) && cv.GetBoolean();
+        string source = args.TryGetValue("source", out var sv) ? (sv.GetString() ?? "buffer") : "buffer";
 
+        if (source == "buffer")
+        {
+            // Existing behavior — response shape unchanged for backward compat.
+            bool clear = args.TryGetValue("clear", out var cv) && cv.GetBoolean();
+            var bufferLines = new Godot.Collections.Array();
+            foreach (var line in _logBuffer)
+                bufferLines.Add(line);
+            if (clear)
+                _logBuffer.Clear();
+            return new Godot.Collections.Dictionary
+            {
+                ["count"] = bufferLines.Count,
+                ["lines"] = bufferLines,
+            };
+        }
+
+        // Opt-in: read from the Godot log file. Response shape is a
+        // superset of the buffer-mode shape (adds source/path/total_lines)
+        // so consumers reading count/lines still work, but the source
+        // field tells them which mode they got.
+        int tail = args.TryGetValue("tail", out var tv) ? Math.Max(1, tv.GetInt32()) : 50;
+
+        var setting = ProjectSettings.GetSetting("debug/file_logging/log_path", "user://logs/godot.log");
+        string logPath = setting.AsString();
+        if (string.IsNullOrEmpty(logPath))
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = "Godot file logging path is empty (debug/file_logging/log_path)",
+            };
+        }
+        string globalPath = ProjectSettings.GlobalizePath(logPath);
+        if (!File.Exists(globalPath))
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"Log file not found: {globalPath}",
+                ["hint"] = "Ensure debug/file_logging/enable_file_logging is true in project settings.",
+            };
+        }
+
+        string[] allLines;
+        try
+        {
+            allLines = File.ReadAllLines(globalPath);
+        }
+        catch (Exception ex)
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"Read failed: {ex.GetType().Name}: {ex.Message}",
+            };
+        }
+
+        int start = Math.Max(0, allLines.Length - tail);
         var lines = new Godot.Collections.Array();
-        foreach (var line in _logBuffer)
-            lines.Add(line);
-
-        if (clear)
-            _logBuffer.Clear();
+        for (int i = start; i < allLines.Length; i++)
+            lines.Add(allLines[i]);
 
         return new Godot.Collections.Dictionary
         {
+            ["source"] = "file",
+            ["path"] = globalPath,
             ["count"] = lines.Count,
+            ["total_lines"] = allLines.Length,
             ["lines"] = lines,
         };
     }
@@ -1426,6 +1508,339 @@ public partial class GodotPilot : Node
         // Anything in the Godot namespace counts as framework — Node, Object, etc.
         var ns = type.Namespace;
         return ns != null && (ns == "Godot" || ns.StartsWith("Godot."));
+    }
+
+    // ── Reflection: static type inspection ──────────────────────────
+
+    /// <summary>
+    /// Inspect static fields and properties on a C# type by name. The
+    /// game-side equivalent of <see cref="CmdDescribe"/> for things that
+    /// don't live on a Node — typically static data tables (DataLoader.SpellById,
+    /// item catalogs, configuration constants).
+    ///
+    /// <para>Args: <c>type</c> (fully-qualified or short C# type name),
+    /// optional <c>member</c> (single field/property to inspect — if
+    /// omitted, all public statics are dumped), optional <c>depth</c>
+    /// (recursion depth for nested objects, 0-3, default 1).</para>
+    ///
+    /// <para>Type lookup walks all loaded assemblies. Both fully qualified
+    /// names (<c>OdeToTheBard.Data.DataLoader</c>) and short names
+    /// (<c>DataLoader</c>) are accepted; the resolved <c>FullName</c> is
+    /// returned in the result so the caller knows which type was matched.
+    /// On a name conflict, the first match wins — disambiguate by passing
+    /// the fully qualified name.</para>
+    /// </summary>
+    private Godot.Collections.Dictionary CmdStatic(Dictionary<string, JsonElement> args)
+    {
+        string typeName = args.TryGetValue("type", out var tv) ? (tv.GetString() ?? "") : "";
+        string? memberName = args.TryGetValue("member", out var mv) ? mv.GetString() : null;
+        int depth = args.TryGetValue("depth", out var dv) ? Math.Clamp(dv.GetInt32(), 0, 3) : 1;
+
+        if (string.IsNullOrEmpty(typeName))
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = "type required",
+            };
+        }
+
+        var type = ResolveTypeByName(typeName);
+        if (type == null)
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"Type not found: {typeName}",
+            };
+        }
+
+        var result = new Godot.Collections.Dictionary
+        {
+            ["type"] = type.FullName ?? type.Name,
+        };
+
+        const BindingFlags staticFlags = BindingFlags.Public | BindingFlags.Static;
+
+        if (memberName != null)
+        {
+            // Single member: try property first, then field.
+            var prop = type.GetProperty(memberName, staticFlags);
+            FieldInfo? field = null;
+            if (prop == null)
+                field = type.GetField(memberName, staticFlags);
+
+            if (prop == null && field == null)
+            {
+                var available = new Godot.Collections.Array();
+                foreach (var p in type.GetProperties(staticFlags)) available.Add(p.Name);
+                foreach (var f in type.GetFields(staticFlags)) available.Add(f.Name);
+                return new Godot.Collections.Dictionary
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Member not found: {type.Name}.{memberName}",
+                    ["available"] = available,
+                };
+            }
+
+            try
+            {
+                object? value = prop != null ? prop.GetValue(null) : field!.GetValue(null);
+                result["member"] = memberName;
+                result["value"] = SerializeValue(value, depth);
+            }
+            catch (Exception ex)
+            {
+                return new Godot.Collections.Dictionary
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Get threw: {ex.GetType().Name}: {ex.Message}",
+                };
+            }
+        }
+        else
+        {
+            // All public static members
+            var members = new Godot.Collections.Dictionary();
+            foreach (var prop in type.GetProperties(staticFlags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+                if (!prop.CanRead) continue;
+                try { members[prop.Name] = SerializeValue(prop.GetValue(null), depth); }
+                catch (Exception ex) { members[prop.Name] = $"<error: {ex.GetType().Name}>"; }
+            }
+            foreach (var field in type.GetFields(staticFlags))
+            {
+                try { members[field.Name] = SerializeValue(field.GetValue(null), depth); }
+                catch (Exception ex) { members[field.Name] = $"<error: {ex.GetType().Name}>"; }
+            }
+            result["members"] = members;
+        }
+
+        return result;
+    }
+
+    // ── Reflection: method invocation ───────────────────────────────
+
+    /// <summary>
+    /// Invoke an instance method on a Node (target = "/node/path") or a
+    /// static method on a type (target = "Namespace.TypeName"). Argument
+    /// values are passed as a JSON array; primitive types (string, int,
+    /// long, double, bool, null) are coerced to the method's parameter
+    /// types automatically. Enum parameters accept their string name.
+    /// Complex parameter types are not supported in v1 — for those, write
+    /// a project-specific dev command via <c>RegisterCommand</c>.
+    ///
+    /// <para>Args: <c>target</c> (string — node path or type name),
+    /// <c>method</c> (string), optional <c>args</c> (array of values).</para>
+    ///
+    /// <para>Returns: <c>{ok, method, returned}</c> on success;
+    /// <c>{ok: false, error, available?}</c> on failure (with the available
+    /// method names listed when the method isn't found).</para>
+    /// </summary>
+    private Godot.Collections.Dictionary CmdInvoke(Dictionary<string, JsonElement> args)
+    {
+        string target = args.TryGetValue("target", out var tv) ? (tv.GetString() ?? "") : "";
+        string methodName = args.TryGetValue("method", out var mv) ? (mv.GetString() ?? "") : "";
+
+        if (string.IsNullOrEmpty(target) || string.IsNullOrEmpty(methodName))
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = "target and method required",
+            };
+        }
+
+        // Parse args array — accept JSON array or omit entirely.
+        var methodArgsList = new List<object?>();
+        if (args.TryGetValue("args", out var av) && av.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var element in av.EnumerateArray())
+                methodArgsList.Add(JsonElementToObject(element));
+        }
+
+        // Resolve target: instance method (node path starts with /) or static method (type name).
+        object? instance = null;
+        Type? type;
+        if (target.StartsWith("/"))
+        {
+            var node = GetNodeOrNull(target);
+            if (node == null)
+            {
+                return new Godot.Collections.Dictionary
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Node not found: {target}",
+                };
+            }
+            instance = node;
+            type = node.GetType();
+        }
+        else
+        {
+            type = ResolveTypeByName(target);
+            if (type == null)
+            {
+                return new Godot.Collections.Dictionary
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Type not found: {target}",
+                };
+            }
+        }
+
+        var bindingFlags = instance != null
+            ? BindingFlags.Public | BindingFlags.Instance
+            : BindingFlags.Public | BindingFlags.Static;
+
+        var methods = type.GetMethods(bindingFlags).Where(m => m.Name == methodName).ToArray();
+        if (methods.Length == 0)
+        {
+            var available = new Godot.Collections.Array();
+            foreach (var m in type.GetMethods(bindingFlags).Take(50))
+                available.Add(m.Name);
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"Method not found: {type.Name}.{methodName}",
+                ["available"] = available,
+            };
+        }
+
+        // Pick the first overload that matches arg count and accepts coerced args.
+        MethodInfo? chosen = null;
+        object?[]? coerced = null;
+        foreach (var method in methods)
+        {
+            var parameters = method.GetParameters();
+            if (parameters.Length != methodArgsList.Count) continue;
+            try
+            {
+                var argsArray = new object?[parameters.Length];
+                for (int i = 0; i < parameters.Length; i++)
+                    argsArray[i] = CoerceArg(methodArgsList[i], parameters[i].ParameterType);
+                chosen = method;
+                coerced = argsArray;
+                break;
+            }
+            catch
+            {
+                // Try the next overload
+            }
+        }
+
+        if (chosen == null)
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"No overload of {type.Name}.{methodName} matches {methodArgsList.Count} args (with coercible primitive types)",
+            };
+        }
+
+        try
+        {
+            object? returned = chosen.Invoke(instance, coerced);
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = true,
+                ["method"] = $"{type.Name}.{methodName}",
+                ["returned"] = SerializeValue(returned, 1),
+            };
+        }
+        catch (TargetInvocationException ex)
+        {
+            var inner = ex.InnerException ?? ex;
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"Invoke threw: {inner.GetType().Name}: {inner.Message}",
+            };
+        }
+    }
+
+    // ── Reflection helpers ──────────────────────────────────────────
+
+    /// <summary>
+    /// Resolve a C# type by name. Tries direct <see cref="Type.GetType(string)"/>
+    /// first, then walks every loaded assembly looking for a fully qualified
+    /// or short-name match. Used by <see cref="CmdStatic"/> and the
+    /// static-method path of <see cref="CmdInvoke"/>.
+    /// </summary>
+    private static Type? ResolveTypeByName(string typeName)
+    {
+        var t = Type.GetType(typeName);
+        if (t != null) return t;
+
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try
+            {
+                t = asm.GetType(typeName);
+                if (t != null) return t;
+
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch (ReflectionTypeLoadException rtle) { types = rtle.Types.Where(x => x != null).ToArray()!; }
+
+                foreach (var candidate in types)
+                {
+                    if (candidate == null) continue;
+                    if (candidate.FullName == typeName) return candidate;
+                    if (candidate.Name == typeName) return candidate;
+                }
+            }
+            catch (Exception)
+            {
+                // Skip assemblies that can't be reflected
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Convert a JSON element to a CLR primitive (string/long/double/bool/null).
+    /// Used by <see cref="CmdInvoke"/> to unpack the args array before
+    /// per-parameter type coercion.
+    /// </summary>
+    private static object? JsonElementToObject(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.String => el.GetString(),
+        JsonValueKind.Number => el.TryGetInt64(out var l) ? (object)l : el.GetDouble(),
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null => null,
+        _ => el.GetRawText(),
+    };
+
+    /// <summary>
+    /// Coerce a primitive value to a target parameter type. Handles
+    /// nullable wrappers, enum names (string → enum value, case-insensitive),
+    /// and standard numeric conversions via <see cref="Convert.ChangeType(object, Type)"/>.
+    /// Throws on incompatible coercion so the caller can fall through to
+    /// the next overload.
+    /// </summary>
+    private static object? CoerceArg(object? value, Type targetType)
+    {
+        if (value == null)
+        {
+            if (targetType.IsValueType && Nullable.GetUnderlyingType(targetType) == null)
+                throw new InvalidCastException($"Cannot pass null to value type {targetType.Name}");
+            return null;
+        }
+
+        var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
+        if (underlying.IsEnum)
+        {
+            if (value is string s) return Enum.Parse(underlying, s, ignoreCase: true);
+            return Enum.ToObject(underlying, value);
+        }
+
+        if (underlying.IsInstanceOfType(value)) return value;
+
+        return Convert.ChangeType(value, underlying);
     }
 
     private static Variant SerializeValue(object? value, int depth)

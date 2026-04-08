@@ -348,7 +348,51 @@ def cmd_perf(args, host, port, pretty):
 
 
 def cmd_log(args, host, port, pretty):
-    result = send_command(host, port, "log", {"clear": args.clear})
+    a = {"source": args.source}
+    if args.source == "buffer":
+        a["clear"] = args.clear
+    elif args.source == "file":
+        a["tail"] = args.tail
+    result = send_command(host, port, "log", a)
+    emit(result, pretty)
+
+
+def cmd_static(args, host, port, pretty):
+    a = {"type": args.type}
+    if args.member:
+        a["member"] = args.member
+    if args.depth is not None:
+        a["depth"] = args.depth
+    result = send_command(host, port, "static", a)
+    emit(result, pretty)
+
+
+def cmd_invoke(args, host, port, pretty):
+    """Invoke a method on a node (target = /path) or static type (target = TypeName).
+
+    Positional `args` are parsed as int/float/bool/string with the same
+    auto-coercion rules as `cmd`. They're sent to the server as a JSON
+    array; the server-side reflection layer coerces each value to the
+    matching method parameter type.
+    """
+    a = {"target": args.target, "method": args.method}
+    if args.args:
+        method_args = []
+        for raw in args.args:
+            if raw.lower() in ("true", "false"):
+                method_args.append(raw.lower() == "true")
+            elif raw.lower() == "null":
+                method_args.append(None)
+            else:
+                try:
+                    method_args.append(int(raw))
+                except ValueError:
+                    try:
+                        method_args.append(float(raw))
+                    except ValueError:
+                        method_args.append(raw)
+        a["args"] = method_args
+    result = send_command(host, port, "invoke", a)
     emit(result, pretty)
 
 
@@ -617,7 +661,23 @@ def main():
 
     # log
     p = sub.add_parser("log", help="Read captured log output")
-    p.add_argument("--clear", action="store_true", help="Clear log after reading")
+    p.add_argument("--source", choices=["buffer", "file"], default="buffer",
+                   help="buffer (default, in-memory CaptureLog ring) or file (Godot log file tail)")
+    p.add_argument("--clear", action="store_true", help="Clear buffer after reading (buffer source only)")
+    p.add_argument("--tail", type=int, default=50, help="Number of lines to return (file source only, default 50)")
+
+    # static
+    p = sub.add_parser("static", help="Inspect static C# fields/properties on a type via reflection")
+    p.add_argument("type", help="Fully qualified or short C# type name (e.g. 'OdeToTheBard.Data.DataLoader' or 'DataLoader')")
+    p.add_argument("member", nargs="?", default=None,
+                   help="Optional: single static field/property to inspect. Omitted = dump all public statics.")
+    p.add_argument("--depth", type=int, default=None, help="Recursion depth for nested objects (0-3, default 1)")
+
+    # invoke
+    p = sub.add_parser("invoke", help="Invoke a method on a node or static type via reflection")
+    p.add_argument("target", help="Node path (starts with /) or fully qualified type name for static methods")
+    p.add_argument("method", help="Method name")
+    p.add_argument("args", nargs="*", help="Method arguments — primitives auto-parsed (int/float/bool/string/null)")
 
     # wait
     p = sub.add_parser("wait", help="Wait for specified time")
@@ -673,6 +733,8 @@ def main():
         "viewport_info": cmd_viewport_info,
         "perf": cmd_perf,
         "log": cmd_log,
+        "static": cmd_static,
+        "invoke": cmd_invoke,
         "wait": cmd_wait,
         "cmd": cmd_game_cmd,
         "console": cmd_console,

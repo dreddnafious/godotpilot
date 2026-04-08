@@ -51,8 +51,10 @@ The commands below are **built-in** and always available when the autoload is lo
 |---|---|
 | `signals [--node PATH] [--name PATTERN] [--include-unconnected]` | List signals across the scene tree along with their connections. Each entry: emitting node, signal name, parameter types, and `(target, method)` for every subscriber. With no flags, walks every node under `/root` and reports only connected signals. `--node` limits to one node. `--name` filters by substring (case-insensitive). `--include-unconnected` reveals dead signals (declared but never subscribed) — useful for spotting drift. |
 | `describe NODE_PATH [--include-godot] [--depth N]` | Walk **public C# properties and fields** on a node via reflection and dump them as JSON. Filters out properties declared on `Godot.Node` and its bases by default — you see your game state, not framework noise. `--include-godot` adds the framework properties back. `--depth N` (0-3, default 1) controls recursion into nested non-primitive members. Lists are truncated to the first 50 items. |
+| `static TYPE [MEMBER] [--depth N]` | Walk **public static fields and properties** on a C# type via reflection. Like `describe` but for things that don't live on a Node — typically static data tables, configuration constants, singleton holders. `TYPE` is a fully qualified name (`MyGame.Data.ItemLibrary`) or a short name (`ItemLibrary`); the resolver walks every loaded assembly. With `MEMBER`, returns just that one field/property. Without, returns all public statics. |
+| `invoke TARGET METHOD [ARGS...]` | Invoke a method on a node (`TARGET` starts with `/`) or a static type (`TARGET` is a type name). Positional `ARGS` are auto-parsed as `int`, `float`, `bool`, `null`, or string fallback, then coerced to the matching method parameter types server-side. Enum parameters accept their string name. Complex parameter types (records, custom classes) are not supported in v1 — for those, write a project-specific dev command via `RegisterCommand`. Method overloads are matched by argument count first, then by coercibility. |
 
-These two commands are the answer to "how do I read live game state without writing per-game `RegisterCommand` bindings?" `signals` answers "what handles event X" without grepping; `describe` answers "what's the current state of system Y" without anyone authoring a typed accessor for it.
+These reflection commands answer "how do I read or invoke live game state without writing per-game `RegisterCommand` bindings?" `signals` answers "what handles event X" without grepping; `describe` answers "what's the current state of system Y on this Node"; `static` answers the same question for things that live in `static class` instead of on a Node (data libraries, catalogs, configuration); `invoke` lets you call any public method to test a code path or trigger a side effect without a custom dev command.
 
 **Example — find every subscriber of a combat event:**
 
@@ -107,11 +109,46 @@ tools/gdpilot describe /root/PartyManager
 
 No `RegisterCommand("get_party", ...)` was authored. The reflection layer discovered everything from the type definition.
 
+**Example — inspect a static data library without a custom dev command:**
+
+```bash
+tools/gdpilot static MyGame.Data.ItemLibrary ById --depth 2
+```
+
+```json
+{
+  "ok": true,
+  "type": "MyGame.Data.ItemLibrary",
+  "member": "ById",
+  "value": {
+    "healing_potion": {"_type": "ItemData", "Id": "healing_potion", "Name": "Healing Potion", "Slot": null, ...},
+    "longsword": {"_type": "ItemData", "Id": "longsword", "Name": "Longsword", "Slot": "Weapon", ...},
+    ...
+  }
+}
+```
+
+**Example — invoke a method on an autoload to trigger a side effect:**
+
+```bash
+tools/gdpilot invoke /root/PartyManager AddItem healing_potion 1 true
+```
+
+```json
+{
+  "ok": true,
+  "method": "PartyManager.AddItem",
+  "returned": true
+}
+```
+
+The argument coercion handles primitives and enum names. For methods that take complex types (records, custom classes), write a project-specific dev command via `RegisterCommand` — `invoke` is intentionally limited to keep the surface small.
+
 ## Logging
 
 | Command | Description |
 |---|---|
-| `log [--clear]` | Read the in-game log buffer (last 500 lines of `GD.Print` output captured by the autoload). `--clear` empties the buffer after reading. |
+| `log [--source buffer\|file] [--clear] [--tail N]` | Read recent log lines. `--source buffer` (default, preserved from the original command shape) returns the in-memory `CaptureLog` ring buffer; `--clear` empties the buffer after reading. `--source file` reads the last `--tail` lines (default 50) of the running game's Godot log file (resolved via `ProjectSettings("debug/file_logging/log_path")`, defaulting to `user://logs/godot.log`) — useful when nothing has wired the in-memory buffer but Godot's file logger is on. |
 
 ## Wait
 
