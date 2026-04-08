@@ -62,16 +62,27 @@ This is the only step the install can't do for you safely — your existing `pro
 With the game running, from inside the project directory:
 
 ```bash
-tools/gdpilot screenshot                  # save a viewport PNG, return path + dimensions
-tools/gdpilot tree --depth 2               # dump the scene tree
-tools/gdpilot find Button                  # find all nodes with "Button" in the name
-tools/gdpilot props /root/Game             # dump every public property on a node
-tools/gdpilot click 640 360                # click at viewport coords
-tools/gdpilot click_node --text "Start"    # click a button by its text
-tools/gdpilot perf                         # FPS, memory, draw calls
-tools/gdpilot log                          # capture buffered GD.Print output
-tools/gdpilot list                         # list all registered commands
+tools/gdpilot screenshot                          # save a viewport PNG, return path + dimensions
+tools/gdpilot tree --depth 2                       # dump the scene tree
+tools/gdpilot find Button                          # find all nodes with "Button" in the name
+tools/gdpilot props /root/Game                     # dump Godot framework properties
+tools/gdpilot click 640 360                        # click at viewport coords
+tools/gdpilot click_node --text "Start"            # click a button by its text
+tools/gdpilot perf                                 # FPS, memory, draw calls
+tools/gdpilot log                                  # capture buffered GD.Print output
+tools/gdpilot list                                 # list all registered commands
 ```
+
+For runtime introspection — answering "what handles event X" and "what's the current state of system Y" without grepping source or authoring per-game bindings:
+
+```bash
+tools/gdpilot signals --name CombatStarted         # who subscribes to CombatStarted, with arg types
+tools/gdpilot signals --include-unconnected        # also reveal declared-but-orphan signals
+tools/gdpilot describe /root/PartyManager          # walk public C# properties via reflection
+tools/gdpilot describe /root/CombatManager --depth 2   # recurse into nested objects
+```
+
+Both are pure reflection — they work against any C# Godot project without per-game registration. See [COMMANDS.md § Reflection](COMMANDS.md#reflection-signal-graph--c-state) for the full reference.
 
 For game lifecycle:
 

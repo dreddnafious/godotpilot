@@ -131,6 +131,62 @@ Response (entirely up to the game's handler):
 {"ok": true, "state": "InGame", "score": 1230, "wave": 7}
 ```
 
+### Inspect signal subscription graph
+
+Request:
+```json
+{"cmd": "signals", "args": {"name": "CombatStarted"}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "count": 1,
+  "signals": [
+    {
+      "node": "/root/EventBus",
+      "node_type": "EventBus",
+      "signal": "CombatStarted",
+      "args": [{"name": "encounterJson", "type": "String"}],
+      "connection_count": 2,
+      "connections": [
+        {"target": "/root/MainGame/CombatManager", "method": "OnCombatStarted"},
+        {"target": "/root/MainGame/CombatUI", "method": "_on_combat_started"}
+      ]
+    }
+  ]
+}
+```
+
+Optional args: `node` (limit to one node by path), `name` (case-insensitive substring filter on signal name), `include_unconnected` (boolean, defaults false — set true to also report signals with zero subscribers).
+
+### Describe an autoload's C# state via reflection
+
+Request:
+```json
+{"cmd": "describe", "args": {"node_path": "/root/PartyManager"}}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "node": "/root/PartyManager",
+  "type": "OdeToTheBard.Party.PartyManager",
+  "godot_type": "Node",
+  "properties": {
+    "Gold": 500,
+    "Peril": 23,
+    "TickCount": 142,
+    "PartyCount": 6,
+    "ActiveSongId": "warcry"
+  }
+}
+```
+
+Optional args: `include_godot` (boolean, defaults false — set true to also include Godot framework properties like `name`, `position`, `process_priority`), `depth` (integer 0-3, default 1 — controls recursion into nested non-primitive members; lists truncate at 50 items).
+
 ## Connection lifecycle
 
 - **Connect** any time after the autoload's `_Ready` runs. The autoload prints `[GodotPilot] Listening on 127.0.0.1:6550` when ready. Connection refused before that point.
