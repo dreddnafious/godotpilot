@@ -370,30 +370,55 @@ def cmd_static(args, host, port, pretty):
 def cmd_invoke(args, host, port, pretty):
     """Invoke a method on a node (target = /path) or static type (target = TypeName).
 
-    Positional `args` are parsed as int/float/bool/string with the same
-    auto-coercion rules as `cmd`. They're sent to the server as a JSON
-    array; the server-side reflection layer coerces each value to the
-    matching method parameter type.
+    Positional `args` are parsed in this order: bool, null, int, float,
+    JSON object/array (anything starting with `{` or `[`), then string
+    fallback. The JSON path lets you call methods that take complex
+    parameter types (records, classes, lists, dictionaries) by passing
+    a JSON literal on the command line. The server-side reflection layer
+    deserializes via the autoload's InvokeJsonOptions, which handles
+    polymorphic types declared with [JsonDerivedType] automatically.
+
+    Examples:
+        # Primitive args
+        gdpilot invoke /root/PartyManager AddItem healing_potion 1 true
+
+        # Complex arg — pass an ActiveBuff record as JSON
+        gdpilot invoke /root/PartyManager ApplyBuff \\
+            '{"id":"stoneskin","effect":{"$type":"ac","Bonus":2},"lifetime":"Tick","RemainingTicks":10}'
     """
     a = {"target": args.target, "method": args.method}
     if args.args:
         method_args = []
         for raw in args.args:
-            if raw.lower() in ("true", "false"):
-                method_args.append(raw.lower() == "true")
-            elif raw.lower() == "null":
-                method_args.append(None)
-            else:
-                try:
-                    method_args.append(int(raw))
-                except ValueError:
-                    try:
-                        method_args.append(float(raw))
-                    except ValueError:
-                        method_args.append(raw)
+            method_args.append(_parse_invoke_arg(raw))
         a["args"] = method_args
     result = send_command(host, port, "invoke", a)
     emit(result, pretty)
+
+
+def _parse_invoke_arg(raw):
+    """Parse one positional invoke arg using the precedence:
+    bool → null → int → float → JSON object/array → string."""
+    lower = raw.lower()
+    if lower in ("true", "false"):
+        return lower == "true"
+    if lower == "null":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    stripped = raw.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+    return raw
 
 
 def cmd_wait(args, host, port, pretty):

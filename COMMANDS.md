@@ -52,7 +52,7 @@ The commands below are **built-in** and always available when the autoload is lo
 | `signals [--node PATH] [--name PATTERN] [--include-unconnected]` | List signals across the scene tree along with their connections. Each entry: emitting node, signal name, parameter types, and `(target, method)` for every subscriber. With no flags, walks every node under `/root` and reports only connected signals. `--node` limits to one node. `--name` filters by substring (case-insensitive). `--include-unconnected` reveals dead signals (declared but never subscribed) — useful for spotting drift. |
 | `describe NODE_PATH [--include-godot] [--depth N]` | Walk **public C# properties and fields** on a node via reflection and dump them as JSON. Filters out properties declared on `Godot.Node` and its bases by default — you see your game state, not framework noise. `--include-godot` adds the framework properties back. `--depth N` (0-3, default 1) controls recursion into nested non-primitive members. Lists are truncated to the first 50 items. |
 | `static TYPE [MEMBER] [--depth N]` | Walk **public static fields and properties** on a C# type via reflection. Like `describe` but for things that don't live on a Node — typically static data tables, configuration constants, singleton holders. `TYPE` is a fully qualified name (`MyGame.Data.ItemLibrary`) or a short name (`ItemLibrary`); the resolver walks every loaded assembly. With `MEMBER`, returns just that one field/property. Without, returns all public statics. |
-| `invoke TARGET METHOD [ARGS...]` | Invoke a method on a node (`TARGET` starts with `/`) or a static type (`TARGET` is a type name). Positional `ARGS` are auto-parsed as `int`, `float`, `bool`, `null`, or string fallback, then coerced to the matching method parameter types server-side. Enum parameters accept their string name. Complex parameter types (records, custom classes) are not supported in v1 — for those, write a project-specific dev command via `RegisterCommand`. Method overloads are matched by argument count first, then by coercibility. |
+| `invoke TARGET METHOD [ARGS...]` | Invoke a method on a node (`TARGET` starts with `/`) or a static type (`TARGET` is a type name). Positional `ARGS` are auto-parsed as `int`, `float`, `bool`, `null`, JSON object/array (anything starting with `{` or `[`), or string fallback. Simple types (primitives, strings, enums) are coerced server-side; complex types (records, classes, lists, dictionaries, polymorphic hierarchies declared with `[JsonDerivedType]`) are deserialized via the autoload's `InvokeJsonOptions` (project-overridable from `DevConsole._Ready`). Method overloads are matched by argument count first, then by coercibility. |
 
 These reflection commands answer "how do I read or invoke live game state without writing per-game `RegisterCommand` bindings?" `signals` answers "what handles event X" without grepping; `describe` answers "what's the current state of system Y on this Node"; `static` answers the same question for things that live in `static class` instead of on a Node (data libraries, catalogs, configuration); `invoke` lets you call any public method to test a code path or trigger a side effect without a custom dev command.
 
@@ -142,7 +142,35 @@ tools/gdpilot invoke /root/PartyManager AddItem healing_potion 1 true
 }
 ```
 
-The argument coercion handles primitives and enum names. For methods that take complex types (records, custom classes), write a project-specific dev command via `RegisterCommand` — `invoke` is intentionally limited to keep the surface small.
+**Example — invoke a method that takes a complex parameter type:**
+
+Pass the complex argument as a JSON literal on the command line. The
+server-side reflection layer detects that the parameter is not a simple
+type and deserializes via `InvokeJsonOptions`. Polymorphic hierarchies
+declared with `[JsonDerivedType]` work because the type metadata carries
+the discriminator independent of the JSON options.
+
+```bash
+tools/gdpilot invoke /root/PartyManager ApplyBuff \
+    '{"id":"stoneskin","effect":{"$type":"ac","Bonus":2},"lifetime":"Tick","RemainingTicks":10}'
+```
+
+For project-specific data shapes that need custom converters, override
+`GodotPilot.InvokeJsonOptions` from `DevConsole._Ready`:
+
+```csharp
+public override void _Ready()
+{
+    var pilot = GetNode<GodotPilot.GodotPilot>("/root/GodotPilot");
+    pilot.InvokeJsonOptions = new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        Converters = { new JsonStringEnumConverter() },
+    };
+    // ... RegisterCommand calls
+}
+```
 
 ## Logging
 

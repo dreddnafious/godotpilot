@@ -27,6 +27,30 @@ public partial class GodotPilot : Node
     private readonly List<string> _logBuffer = new();
     private const int MaxLogLines = 500;
 
+    /// <summary>
+    /// JSON deserialization options used by <c>invoke</c> when an argument
+    /// targets a complex C# type (record, class, list, dictionary, etc.).
+    /// Primitive parameter types (string/int/long/double/bool, nullable
+    /// thereof, and enums) bypass this and use direct coercion.
+    ///
+    /// <para>Default is case-insensitive property matching plus a string
+    /// enum converter — sufficient for most C# domain models. Projects
+    /// with snake_case JSON conventions, custom converters, or polymorphic
+    /// type discriminators that need extra options should override this
+    /// from their <c>DevConsole._Ready</c> by assigning a new
+    /// <see cref="JsonSerializerOptions"/> instance.</para>
+    ///
+    /// <para>Polymorphic types declared with
+    /// <c>[JsonPolymorphic]</c> + <c>[JsonDerivedType]</c> attributes
+    /// work out of the box because the discriminator strings are read
+    /// from the type metadata, independent of options.</para>
+    /// </summary>
+    public System.Text.Json.JsonSerializerOptions InvokeJsonOptions { get; set; } = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
+    };
+
     // For capturing GD.Print output
     private bool _captureLog = true;
 
@@ -1652,12 +1676,15 @@ public partial class GodotPilot : Node
             };
         }
 
-        // Parse args array — accept JSON array or omit entirely.
-        var methodArgsList = new List<object?>();
+        // Parse args array — accept JSON array or omit entirely. Each element
+        // is kept as a JsonElement so CoerceArg can decide between primitive
+        // coercion (for value/string/enum parameters) and JSON deserialization
+        // (for records, classes, lists, dictionaries, etc).
+        var methodArgsList = new List<JsonElement>();
         if (args.TryGetValue("args", out var av) && av.ValueKind == JsonValueKind.Array)
         {
             foreach (var element in av.EnumerateArray())
-                methodArgsList.Add(JsonElementToObject(element));
+                methodArgsList.Add(element);
         }
 
         // Resolve target: instance method (node path starts with /) or static method (type name).
@@ -1719,7 +1746,7 @@ public partial class GodotPilot : Node
             {
                 var argsArray = new object?[parameters.Length];
                 for (int i = 0; i < parameters.Length; i++)
-                    argsArray[i] = CoerceArg(methodArgsList[i], parameters[i].ParameterType);
+                    argsArray[i] = CoerceArg(methodArgsList[i], parameters[i].ParameterType, InvokeJsonOptions);
                 chosen = method;
                 coerced = argsArray;
                 break;
@@ -1735,7 +1762,7 @@ public partial class GodotPilot : Node
             return new Godot.Collections.Dictionary
             {
                 ["ok"] = false,
-                ["error"] = $"No overload of {type.Name}.{methodName} matches {methodArgsList.Count} args (with coercible primitive types)",
+                ["error"] = $"No overload of {type.Name}.{methodName} matches {methodArgsList.Count} args (primitive coercion or JSON deserialization both failed)",
             };
         }
 
@@ -1800,30 +1827,21 @@ public partial class GodotPilot : Node
     }
 
     /// <summary>
-    /// Convert a JSON element to a CLR primitive (string/long/double/bool/null).
-    /// Used by <see cref="CmdInvoke"/> to unpack the args array before
-    /// per-parameter type coercion.
+    /// Coerce a JSON element to a target method parameter type. The strategy
+    /// is two-tier: simple types (primitive, string, enum, nullable thereof)
+    /// get fast-path primitive coercion via <see cref="Convert.ChangeType(object, Type)"/>;
+    /// complex types (records, classes, lists, dictionaries, polymorphic
+    /// hierarchies) are deserialized via
+    /// <see cref="JsonElement.Deserialize(Type, JsonSerializerOptions)"/>
+    /// using the autoload's <see cref="InvokeJsonOptions"/>. Throws on
+    /// incompatible coercion so <see cref="CmdInvoke"/> can fall through
+    /// to the next overload.
     /// </summary>
-    private static object? JsonElementToObject(JsonElement el) => el.ValueKind switch
+    private static object? CoerceArg(JsonElement value, Type targetType, JsonSerializerOptions jsonOptions)
     {
-        JsonValueKind.String => el.GetString(),
-        JsonValueKind.Number => el.TryGetInt64(out var l) ? (object)l : el.GetDouble(),
-        JsonValueKind.True => true,
-        JsonValueKind.False => false,
-        JsonValueKind.Null => null,
-        _ => el.GetRawText(),
-    };
-
-    /// <summary>
-    /// Coerce a primitive value to a target parameter type. Handles
-    /// nullable wrappers, enum names (string → enum value, case-insensitive),
-    /// and standard numeric conversions via <see cref="Convert.ChangeType(object, Type)"/>.
-    /// Throws on incompatible coercion so the caller can fall through to
-    /// the next overload.
-    /// </summary>
-    private static object? CoerceArg(object? value, Type targetType)
-    {
-        if (value == null)
+        // Null handling — first because the underlying type check below
+        // doesn't apply to a null JSON value.
+        if (value.ValueKind == JsonValueKind.Null)
         {
             if (targetType.IsValueType && Nullable.GetUnderlyingType(targetType) == null)
                 throw new InvalidCastException($"Cannot pass null to value type {targetType.Name}");
@@ -1832,16 +1850,47 @@ public partial class GodotPilot : Node
 
         var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
 
-        if (underlying.IsEnum)
+        // Simple types — primitive coercion path. Matches the original
+        // behavior so existing invoke calls keep working unchanged.
+        if (IsSimpleType(underlying))
         {
-            if (value is string s) return Enum.Parse(underlying, s, ignoreCase: true);
-            return Enum.ToObject(underlying, value);
+            object? primitive = value.ValueKind switch
+            {
+                JsonValueKind.String => value.GetString(),
+                JsonValueKind.Number => value.TryGetInt64(out var l) ? (object)l : value.GetDouble(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => throw new InvalidCastException(
+                    $"Cannot coerce JSON {value.ValueKind} to simple type {underlying.Name}"),
+            };
+
+            if (underlying.IsEnum)
+            {
+                if (primitive is string s) return Enum.Parse(underlying, s, ignoreCase: true);
+                return Enum.ToObject(underlying, primitive!);
+            }
+
+            if (underlying.IsInstanceOfType(primitive)) return primitive;
+            return Convert.ChangeType(primitive, underlying);
         }
 
-        if (underlying.IsInstanceOfType(value)) return value;
-
-        return Convert.ChangeType(value, underlying);
+        // Complex types — JSON deserialization path. Records, classes,
+        // List<T>, Dictionary<K,V>, polymorphic hierarchies declared with
+        // [JsonDerivedType], etc. The discriminator-based polymorphism
+        // works automatically because the converter reads the type
+        // metadata, not the JsonSerializerOptions.
+        return value.Deserialize(underlying, jsonOptions);
     }
+
+    /// <summary>
+    /// True for parameter types that should use primitive coercion rather
+    /// than JSON deserialization in <see cref="CoerceArg"/>. The criterion
+    /// is "values that one might reasonably pass on a CLI": numbers,
+    /// strings, bools, enum names. Everything else (records, classes,
+    /// containers) goes through JSON deserialization.
+    /// </summary>
+    private static bool IsSimpleType(Type t) =>
+        t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(decimal);
 
     private static Variant SerializeValue(object? value, int depth)
     {

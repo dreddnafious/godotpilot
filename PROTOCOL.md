@@ -229,7 +229,10 @@ If the type isn't found, the response includes an `error` field with the unresol
 
 ### Invoke a method on a node or static type
 
-Calls a public method on either a Node instance (target = node path) or a static type (target = type name). Argument values are passed as a JSON array; primitives (string, int, long, double, bool, null) are coerced to the matching method parameter type server-side. Enum parameters accept their string name (case-insensitive).
+Calls a public method on either a Node instance (target = node path) or a static type (target = type name). Argument values are passed as a JSON array. Each element is coerced to the matching method parameter type server-side using a two-tier strategy:
+
+- **Simple types** (primitive numerics, `bool`, `string`, enum names case-insensitive, nullable thereof) — direct coercion.
+- **Complex types** (records, classes, `List<T>`, `Dictionary<K,V>`, polymorphic hierarchies declared with `[JsonDerivedType]`) — JSON deserialization via the autoload's `InvokeJsonOptions`. Projects can override these options from `DevConsole._Ready` to add custom converters or naming policies.
 
 Request — invoke an instance method on an autoload:
 ```json
@@ -259,9 +262,20 @@ Response:
 }
 ```
 
+Request — invoke a method that takes a complex parameter type:
+```json
+{"cmd": "invoke", "args": {
+  "target": "/root/PartyManager",
+  "method": "ApplyBuff",
+  "args": [{"id": "stoneskin", "effect": {"$type": "ac", "Bonus": 2}, "lifetime": "Tick", "RemainingTicks": 10}]
+}}
+```
+
+The complex argument is forwarded to `JsonElement.Deserialize(parameterType, InvokeJsonOptions)`. Polymorphic discriminators (`$type` here) work because they're carried by `[JsonPolymorphic]` / `[JsonDerivedType]` attributes on the type, independent of the JSON options.
+
 Optional args: `args` (array of values — omit or pass `[]` for no-arg methods).
 
-If the method isn't found, the response includes an `available` array listing method names on the resolved type. If overload resolution fails (no matching arg count, or coercion fails for every overload), the error message says so. If the invocation throws, the inner exception is unwrapped and reported as `Invoke threw: <ExceptionType>: <message>`.
+If the method isn't found, the response includes an `available` array listing method names on the resolved type. If overload resolution fails (no matching arg count, or coercion/deserialization fails for every overload), the error message says so. If the invocation throws, the inner exception is unwrapped and reported as `Invoke threw: <ExceptionType>: <message>`.
 
 **Limitation**: only primitive parameter types are supported. Methods that take complex types (records, custom classes, enums on `BindingFlags.NonPublic` types) need a project-specific `RegisterCommand` wrapper.
 
