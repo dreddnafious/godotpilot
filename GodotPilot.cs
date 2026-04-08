@@ -553,11 +553,33 @@ public partial class GodotPilot : Node
             };
         }
 
+        // Two parallel paths because Godot's input system has two:
+        //
+        //   1. Polled state — Input.ActionPress/ActionRelease.
+        //      Reflects in Input.IsActionPressed("name") which polled
+        //      handlers (typically _Process loops) read every frame.
+        //
+        //   2. Event pipeline — Input.ParseInputEvent with a synthesized
+        //      InputEventAction. Propagates through _Input(InputEvent) on
+        //      every Node, where handlers call event.IsActionPressed("name")
+        //      to detect just-pressed events. This is the canonical Godot
+        //      pattern for action-based UI input.
+        //
+        // The original implementation only set the polled state, which
+        // meant `gdpilot action` could not drive _Input handlers — most
+        // UI screens that override _Input never saw the event. Firing
+        // both keeps polled consumers working AND wakes up event-based
+        // _Input handlers.
         Input.ActionPress(name);
+        Input.ParseInputEvent(new InputEventAction { Action = name, Pressed = true });
 
-        // Release after duration
+        // Release after duration — same dual path.
         var timer = GetTree().CreateTimer(durationMs / 1000.0);
-        timer.Timeout += () => Input.ActionRelease(name);
+        timer.Timeout += () =>
+        {
+            Input.ActionRelease(name);
+            Input.ParseInputEvent(new InputEventAction { Action = name, Pressed = false });
+        };
 
         return new Godot.Collections.Dictionary
         {

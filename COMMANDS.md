@@ -32,7 +32,7 @@ The commands below are **built-in** and always available when the autoload is lo
 | `hover --text TEXT \| --path PATH \| --x X --y Y` | Move the cursor — useful for hover-state testing. |
 | `drag X1 Y1 X2 Y2 [--steps N] [--button N]` | Inject a mouse drag with interpolated motion events. |
 | `type "TEXT" [--submit]` | Type characters as `InputEventKey` events. `--submit` presses Enter after. |
-| `action NAME [--duration MS]` | Trigger an `InputMap` action and release it after duration. |
+| `action NAME [--duration MS]` | Trigger an `InputMap` action and release it after duration. Fires both the polled state (`Input.IsActionPressed`) and a synthesized `InputEventAction` through the event pipeline, so polled and event-based handlers (`_Input(InputEvent)` overrides that call `event.IsActionPressed("name")`) both wake up. |
 | `sequence ACTIONS... [--json JSON]` | Schedule overlapping input actions. Positional format: `name:start_ms:duration_ms`. Useful for combined moves like simultaneous pan + zoom. |
 
 ## Scene tree introspection
