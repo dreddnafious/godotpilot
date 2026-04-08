@@ -1,7 +1,10 @@
 namespace GodotPilot;
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Godot;
@@ -259,6 +262,8 @@ public partial class GodotPilot : Node
         RegisterBuiltin("log", CmdLog);
         RegisterBuiltin("wait", CmdWait);
         RegisterBuiltin("list_commands", CmdListCommands);
+        RegisterBuiltin("signals", CmdSignals);
+        RegisterBuiltin("describe", CmdDescribe);
         RegisterBuiltin("quit", CmdQuit);
     }
 
@@ -1137,6 +1142,314 @@ public partial class GodotPilot : Node
             ["builtin"] = builtin,
             ["game"] = game,
         };
+    }
+
+    // ── Reflection: signal subscription graph ───────────────────────
+
+    /// <summary>
+    /// Enumerate signals across the scene tree along with their connections.
+    /// Optional filters: --node PATH (limit to one node), --name PATTERN
+    /// (case-insensitive substring on signal name). With no filters, walks
+    /// every node under /root and reports every user-emitter signal that
+    /// has at least one connection.
+    /// </summary>
+    private Godot.Collections.Dictionary CmdSignals(Dictionary<string, JsonElement> args)
+    {
+        string? nodePathArg = args.TryGetValue("node", out var npv) ? npv.GetString() : null;
+        string? namePattern = args.TryGetValue("name", out var nv) ? nv.GetString() : null;
+        bool includeUnconnected = args.TryGetValue("include_unconnected", out var iuv) && iuv.GetBoolean();
+
+        var results = new Godot.Collections.Array();
+
+        if (nodePathArg != null)
+        {
+            var node = GetNodeOrNull(nodePathArg);
+            if (node == null)
+            {
+                return new Godot.Collections.Dictionary
+                {
+                    ["ok"] = false,
+                    ["error"] = $"Node not found: {nodePathArg}",
+                };
+            }
+            CollectSignalsForNode(node, namePattern, includeUnconnected, results);
+        }
+        else
+        {
+            // Walk the entire scene tree (autoloads + current scene + everything else under /root)
+            CollectSignalsRecursive(GetTree().Root, namePattern, includeUnconnected, results);
+        }
+
+        return new Godot.Collections.Dictionary
+        {
+            ["count"] = results.Count,
+            ["signals"] = results,
+        };
+    }
+
+    private void CollectSignalsRecursive(Node node, string? namePattern, bool includeUnconnected, Godot.Collections.Array results)
+    {
+        CollectSignalsForNode(node, namePattern, includeUnconnected, results);
+        foreach (var child in node.GetChildren())
+            CollectSignalsRecursive(child, namePattern, includeUnconnected, results);
+    }
+
+    private static void CollectSignalsForNode(Node node, string? namePattern, bool includeUnconnected, Godot.Collections.Array results)
+    {
+        Godot.Collections.Array<Godot.Collections.Dictionary> signalList;
+        try
+        {
+            signalList = node.GetSignalList();
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        foreach (var sigDict in signalList)
+        {
+            var sigName = (string)sigDict["name"];
+
+            if (namePattern != null && !sigName.Contains(namePattern, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            // Get connections — list of dicts with "callable", "flags", etc.
+            Godot.Collections.Array<Godot.Collections.Dictionary> connections;
+            try
+            {
+                connections = node.GetSignalConnectionList(sigName);
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            if (connections.Count == 0 && !includeUnconnected)
+                continue;
+
+            var connArr = new Godot.Collections.Array();
+            foreach (var connDict in connections)
+            {
+                if (!connDict.ContainsKey("callable")) continue;
+                var callable = connDict["callable"].AsCallable();
+                var target = callable.Target;
+                var targetPath = target is Node tn ? tn.GetPath().ToString() : (target?.GetClass() ?? "?");
+                connArr.Add(new Godot.Collections.Dictionary
+                {
+                    ["target"] = targetPath,
+                    ["method"] = callable.Method.ToString(),
+                });
+            }
+
+            // Pull arg names + types from the signal definition
+            var argArr = new Godot.Collections.Array();
+            if (sigDict.TryGetValue("args", out var argsVar))
+            {
+                foreach (var a in argsVar.AsGodotArray())
+                {
+                    var ad = a.AsGodotDictionary();
+                    var aname = ad.ContainsKey("name") ? (string)ad["name"] : "";
+                    var atype = ad.ContainsKey("type") ? ((Variant.Type)(int)ad["type"]).ToString() : "?";
+                    argArr.Add(new Godot.Collections.Dictionary
+                    {
+                        ["name"] = aname,
+                        ["type"] = atype,
+                    });
+                }
+            }
+
+            results.Add(new Godot.Collections.Dictionary
+            {
+                ["node"] = node.GetPath().ToString(),
+                ["node_type"] = node.GetClass(),
+                ["signal"] = sigName,
+                ["args"] = argArr,
+                ["connection_count"] = connArr.Count,
+                ["connections"] = connArr,
+            });
+        }
+    }
+
+    // ── Reflection: describe a node's C# instance state ─────────────
+
+    /// <summary>
+    /// Walk public C# properties on a node and dump their values as JSON.
+    /// Filters out properties declared on Godot.Node and its bases (so the
+    /// agent sees game state, not framework noise). Pass --include-godot
+    /// to include the Godot built-ins. Pass --depth N to recurse into
+    /// non-primitive members (default 1, max 3).
+    /// </summary>
+    private Godot.Collections.Dictionary CmdDescribe(Dictionary<string, JsonElement> args)
+    {
+        string nodePath = args.TryGetValue("node_path", out var npv) ? npv.GetString()! : "";
+        bool includeGodot = args.TryGetValue("include_godot", out var igv) && igv.GetBoolean();
+        int depth = args.TryGetValue("depth", out var dv) ? Math.Clamp(dv.GetInt32(), 0, 3) : 1;
+
+        var node = GetNodeOrNull(nodePath);
+        if (node == null)
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["ok"] = false,
+                ["error"] = $"Node not found: {nodePath}",
+            };
+        }
+
+        var type = node.GetType();
+        var properties = DescribeObject(node, type, includeGodot, depth);
+
+        return new Godot.Collections.Dictionary
+        {
+            ["node"] = nodePath,
+            ["type"] = type.FullName ?? type.Name,
+            ["godot_type"] = node.GetClass(),
+            ["properties"] = properties,
+        };
+    }
+
+    private static Godot.Collections.Dictionary DescribeObject(object instance, Type type, bool includeGodot, int depth)
+    {
+        var result = new Godot.Collections.Dictionary();
+
+        // Walk all public instance properties on this type and its bases,
+        // stopping at Godot.Node unless includeGodot is set.
+        var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+        foreach (var prop in props)
+        {
+            // Skip indexers
+            if (prop.GetIndexParameters().Length > 0) continue;
+
+            var declaring = prop.DeclaringType;
+            if (declaring == null) continue;
+
+            // Filter Godot framework properties unless asked
+            if (!includeGodot && IsGodotFrameworkType(declaring)) continue;
+
+            // Skip set-only properties
+            if (!prop.CanRead) continue;
+
+            object? value;
+            try
+            {
+                value = prop.GetValue(instance);
+            }
+            catch (Exception ex)
+            {
+                result[prop.Name] = $"<error: {ex.GetType().Name}>";
+                continue;
+            }
+
+            result[prop.Name] = SerializeValue(value, depth);
+        }
+
+        // Also walk public instance fields (less common but valid)
+        var fields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
+        foreach (var field in fields)
+        {
+            if (!includeGodot && field.DeclaringType != null && IsGodotFrameworkType(field.DeclaringType))
+                continue;
+
+            object? value;
+            try
+            {
+                value = field.GetValue(instance);
+            }
+            catch (Exception ex)
+            {
+                result[field.Name] = $"<error: {ex.GetType().Name}>";
+                continue;
+            }
+
+            result[field.Name] = SerializeValue(value, depth);
+        }
+
+        return result;
+    }
+
+    private static bool IsGodotFrameworkType(Type type)
+    {
+        // Anything in the Godot namespace counts as framework — Node, Object, etc.
+        var ns = type.Namespace;
+        return ns != null && (ns == "Godot" || ns.StartsWith("Godot."));
+    }
+
+    private static Variant SerializeValue(object? value, int depth)
+    {
+        if (value == null) return "null";
+
+        // Primitives — pass through
+        switch (value)
+        {
+            case string s: return s;
+            case bool b: return b;
+            case int i: return i;
+            case long l: return l;
+            case float f: return Math.Round(f, 4);
+            case double d: return Math.Round(d, 4);
+            case Vector2 v2: return new Godot.Collections.Dictionary
+            {
+                ["x"] = Math.Round(v2.X, 4), ["y"] = Math.Round(v2.Y, 4),
+            };
+            case Vector3 v3: return new Godot.Collections.Dictionary
+            {
+                ["x"] = Math.Round(v3.X, 4), ["y"] = Math.Round(v3.Y, 4), ["z"] = Math.Round(v3.Z, 4),
+            };
+            case Color c: return new Godot.Collections.Dictionary
+            {
+                ["r"] = Math.Round(c.R, 4), ["g"] = Math.Round(c.G, 4),
+                ["b"] = Math.Round(c.B, 4), ["a"] = Math.Round(c.A, 4),
+            };
+        }
+
+        // Enums — return as their string name
+        var t = value.GetType();
+        if (t.IsEnum) return value.ToString() ?? "?";
+
+        // Godot Node references — show as path, don't recurse
+        if (value is Node node)
+        {
+            return new Godot.Collections.Dictionary
+            {
+                ["_type"] = "Node",
+                ["path"] = node.GetPath().ToString(),
+                ["class"] = node.GetClass(),
+            };
+        }
+
+        // Collections — serialize as array
+        if (value is IEnumerable enumerable && value is not string)
+        {
+            var arr = new Godot.Collections.Array();
+            int count = 0;
+            foreach (var item in enumerable)
+            {
+                if (count >= 50)
+                {
+                    arr.Add("<truncated>");
+                    break;
+                }
+                arr.Add(SerializeValue(item, Math.Max(0, depth - 1)));
+                count++;
+            }
+            return arr;
+        }
+
+        // Custom class — recurse if depth allows, otherwise toString
+        if (depth > 0 && t.IsClass)
+        {
+            try
+            {
+                var nested = DescribeObject(value, t, includeGodot: false, depth - 1);
+                nested["_type"] = t.Name;
+                return nested;
+            }
+            catch (Exception)
+            {
+                return value.ToString() ?? "?";
+            }
+        }
+
+        return value.ToString() ?? "?";
     }
 
     private Godot.Collections.Dictionary CmdQuit(Dictionary<string, JsonElement> args)

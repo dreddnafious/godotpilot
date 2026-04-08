@@ -240,6 +240,28 @@ def cmd_props(args, host, port, pretty):
     emit(result, pretty)
 
 
+def cmd_signals(args, host, port, pretty):
+    a = {}
+    if args.node:
+        a["node"] = args.node
+    if args.name:
+        a["name"] = args.name
+    if args.include_unconnected:
+        a["include_unconnected"] = True
+    result = send_command(host, port, "signals", a)
+    emit(result, pretty)
+
+
+def cmd_describe(args, host, port, pretty):
+    a = {"node_path": args.node_path}
+    if args.include_godot:
+        a["include_godot"] = True
+    if args.depth is not None:
+        a["depth"] = args.depth
+    result = send_command(host, port, "describe", a)
+    emit(result, pretty)
+
+
 def cmd_set(args, host, port, pretty):
     a = {"node_path": args.node_path, "property": args.property, "value": args.value}
     # Try to parse value as number/bool for proper JSON typing
@@ -543,6 +565,20 @@ def main():
     p = sub.add_parser("props", help="Dump all properties on a node")
     p.add_argument("node_path", help="Node path")
 
+    # signals
+    p = sub.add_parser("signals", help="Inspect signal subscription graph")
+    p.add_argument("--node", default=None, help="Limit to one node by path (default: walk /root recursively)")
+    p.add_argument("--name", default=None, help="Filter signal names by case-insensitive substring")
+    p.add_argument("--include-unconnected", action="store_true",
+                   help="Include signals that have zero subscribers (default: only connected signals)")
+
+    # describe
+    p = sub.add_parser("describe", help="Walk public C# properties on a node and dump as JSON")
+    p.add_argument("node_path", help="Node path")
+    p.add_argument("--include-godot", action="store_true",
+                   help="Include Godot framework properties (Node.name, position, etc.)")
+    p.add_argument("--depth", type=int, default=None, help="Recursion depth for nested objects (0-3, default 1)")
+
     # set
     p = sub.add_parser("set", help="Write a node property")
     p.add_argument("node_path", help="Node path")
@@ -622,6 +658,8 @@ def main():
         "find": cmd_find,
         "get": cmd_get,
         "props": cmd_props,
+        "signals": cmd_signals,
+        "describe": cmd_describe,
         "set": cmd_set,
         "sequence": cmd_sequence,
         "click_node": cmd_click_node,

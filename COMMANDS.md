@@ -41,9 +41,71 @@ The commands below are **built-in** and always available when the autoload is lo
 |---|---|
 | `tree [--path PATH] [--depth N]` | Dump scene tree as nested JSON. Default root `/root`, depth 3. Includes node name, type, position (for `Node3D`). |
 | `find PATTERN [--type TYPE]` | Search nodes by name pattern (case-insensitive substring), optionally filtered by class. Returns name, type, full path, position. |
-| `props NODE_PATH` | Dump every editor/storage property on a node, plus `global_position` and (for `Node3D`/`Control`) size/rotation. Vector and Color types are unpacked into JSON-friendly dicts. |
+| `props NODE_PATH` | Dump every editor/storage property on a node, plus `global_position` and (for `Node3D`/`Control`) size/rotation. Vector and Color types are unpacked into JSON-friendly dicts. Surfaces Godot framework state — for game-defined C# state, use `describe`. |
 | `get NODE_PATH PROPERTY` | Read a single property value from a node. |
 | `set NODE_PATH PROPERTY VALUE` | Write a property. The value is type-converted based on the property's existing `Variant.Type` (so `set ... visible true` works as expected). Vector/Color values can be passed as JSON objects: `'{"x":1,"y":2}'`. |
+
+## Reflection (signal graph + C# state)
+
+| Command | Description |
+|---|---|
+| `signals [--node PATH] [--name PATTERN] [--include-unconnected]` | List signals across the scene tree along with their connections. Each entry: emitting node, signal name, parameter types, and `(target, method)` for every subscriber. With no flags, walks every node under `/root` and reports only connected signals. `--node` limits to one node. `--name` filters by substring (case-insensitive). `--include-unconnected` reveals dead signals (declared but never subscribed) — useful for spotting drift. |
+| `describe NODE_PATH [--include-godot] [--depth N]` | Walk **public C# properties and fields** on a node via reflection and dump them as JSON. Filters out properties declared on `Godot.Node` and its bases by default — you see your game state, not framework noise. `--include-godot` adds the framework properties back. `--depth N` (0-3, default 1) controls recursion into nested non-primitive members. Lists are truncated to the first 50 items. |
+
+These two commands are the answer to "how do I read live game state without writing per-game `RegisterCommand` bindings?" `signals` answers "what handles event X" without grepping; `describe` answers "what's the current state of system Y" without anyone authoring a typed accessor for it.
+
+**Example — find every subscriber of a combat event:**
+
+```bash
+tools/gdpilot signals --name CombatStarted
+```
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "signals": [
+    {
+      "node": "/root/EventBus",
+      "node_type": "EventBus",
+      "signal": "CombatStarted",
+      "args": [{"name": "encounterJson", "type": "String"}],
+      "connection_count": 2,
+      "connections": [
+        {"target": "/root/MainGame/CombatManager", "method": "OnCombatStarted"},
+        {"target": "/root/MainGame/CombatUI", "method": "_on_combat_started"}
+      ]
+    }
+  ]
+}
+```
+
+**Example — read the current state of an autoload without DevConsole bindings:**
+
+```bash
+tools/gdpilot describe /root/PartyManager
+```
+
+```json
+{
+  "ok": true,
+  "node": "/root/PartyManager",
+  "type": "OdeToTheBard.Party.PartyManager",
+  "godot_type": "Node",
+  "properties": {
+    "Gold": 500,
+    "Peril": 23,
+    "TickCount": 142,
+    "PartyCount": 6,
+    "ActiveSongId": "warcry",
+    "ActiveBuffs": [
+      {"_type": "ActiveBuff", "Id": "warcry", "EffectType": "party_attack_bonus", "Value": 3, "RemainingTicks": -1, "IsSong": true}
+    ]
+  }
+}
+```
+
+No `RegisterCommand("get_party", ...)` was authored. The reflection layer discovered everything from the type definition.
 
 ## Logging
 
