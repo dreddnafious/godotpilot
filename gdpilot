@@ -16,7 +16,13 @@ import time
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6550
-TIMEOUT = 10.0
+# Default socket timeout (seconds). Bumped from the original 10s because
+# some server-side commands (notably project-specific game commands that
+# walk a SQLite save layer or instantiate large scenes) take longer than
+# that under cold-cache conditions. The cost of a higher default is paid
+# only on actual failure (when the game isn't running) — the common path
+# returns in milliseconds.
+TIMEOUT = 60.0
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
