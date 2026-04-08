@@ -973,8 +973,8 @@ public partial class GodotPilot : Node
             Variant.Type.Basis => val.ToString(),
             Variant.Type.Aabb => val.ToString(),
             Variant.Type.NodePath => val.AsNodePath().ToString(),
-            Variant.Type.Object => val.AsGodotObject()?.GetClass() ?? "null",
-            Variant.Type.Nil => "null",
+            Variant.Type.Object => val.AsGodotObject() is GodotObject obj ? (Variant)(obj.GetClass().ToString() ?? "Object") : default,
+            Variant.Type.Nil => default,
             _ => val,
         };
     }
@@ -1206,6 +1206,8 @@ public partial class GodotPilot : Node
             return;
         }
 
+        var nodeType = node.GetType();
+
         foreach (var sigDict in signalList)
         {
             var sigName = (string)sigDict["name"];
@@ -1213,7 +1215,14 @@ public partial class GodotPilot : Node
             if (namePattern != null && !sigName.Contains(namePattern, StringComparison.OrdinalIgnoreCase))
                 continue;
 
-            // Get connections — list of dicts with "callable", "flags", etc.
+            var connArr = new Godot.Collections.Array();
+
+            // Source A: GDScript-style and editor-defined connections via Object.GetSignalConnectionList().
+            // Filter out the source-generator's reflexive bridge: when a [Signal] declaration triggers
+            // EmitSignal native dispatch, Godot internally connects the signal to the C# class's
+            // RaiseGodotClassSignalCallbacks override, which appears here as a connection where the
+            // target is the same node and the method name equals the signal name. That's plumbing,
+            // not subscription — skip it.
             Godot.Collections.Array<Godot.Collections.Dictionary> connections;
             try
             {
@@ -1221,25 +1230,71 @@ public partial class GodotPilot : Node
             }
             catch (Exception)
             {
-                continue;
+                connections = new Godot.Collections.Array<Godot.Collections.Dictionary>();
             }
 
-            if (connections.Count == 0 && !includeUnconnected)
-                continue;
-
-            var connArr = new Godot.Collections.Array();
             foreach (var connDict in connections)
             {
                 if (!connDict.ContainsKey("callable")) continue;
                 var callable = connDict["callable"].AsCallable();
-                var target = callable.Target;
-                var targetPath = target is Node tn ? tn.GetPath().ToString() : (target?.GetClass() ?? "?");
+                var callableTarget = callable.Target;
+                var methodName = callable.Method.ToString();
+
+                // Skip the source-generator self-bridge
+                if (callableTarget == (GodotObject)node && methodName == sigName)
+                    continue;
+
+                var targetPath = callableTarget is Node tn ? tn.GetPath().ToString() : (callableTarget?.GetClass() ?? "?");
                 connArr.Add(new Godot.Collections.Dictionary
                 {
                     ["target"] = targetPath,
-                    ["method"] = callable.Method.ToString(),
+                    ["method"] = methodName,
+                    ["kind"] = "connect",
                 });
             }
+
+            // Source B: C# event subscribers attached via the `+=` syntax. The Godot.NET source
+            // generator emits a private field `backing_<SignalName>` of the EventHandler delegate
+            // type, and the public event's add/remove operators write to it. GetSignalConnectionList
+            // never sees these — they live in the delegate's invocation list, accessible only via
+            // reflection on the backing field. This is the dominant subscription style in C#-first
+            // Godot projects, so missing it makes the signal graph essentially invisible.
+            var backingField = nodeType.GetField(
+                "backing_" + sigName,
+                BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (backingField != null && typeof(Delegate).IsAssignableFrom(backingField.FieldType))
+            {
+                Delegate? backingDelegate = null;
+                try
+                {
+                    backingDelegate = backingField.GetValue(node) as Delegate;
+                }
+                catch (Exception)
+                {
+                    // ignore — leave the slot empty
+                }
+
+                if (backingDelegate != null)
+                {
+                    foreach (var sub in backingDelegate.GetInvocationList())
+                    {
+                        var subTarget = sub.Target;
+                        var subTargetPath = subTarget is Node stn
+                            ? stn.GetPath().ToString()
+                            : (subTarget?.GetType().FullName ?? "?");
+                        connArr.Add(new Godot.Collections.Dictionary
+                        {
+                            ["target"] = subTargetPath,
+                            ["method"] = sub.Method.Name,
+                            ["kind"] = "csharp_event",
+                        });
+                    }
+                }
+            }
+
+            if (connArr.Count == 0 && !includeUnconnected)
+                continue;
 
             // Pull arg names + types from the signal definition
             var argArr = new Godot.Collections.Array();
@@ -1375,7 +1430,9 @@ public partial class GodotPilot : Node
 
     private static Variant SerializeValue(object? value, int depth)
     {
-        if (value == null) return "null";
+        // Real JSON null, not the string "null". Json.Stringify on a default
+        // (Nil) Variant produces JSON `null`, which is what consumers expect.
+        if (value == null) return default;
 
         // Primitives — pass through
         switch (value)
